@@ -558,6 +558,8 @@ test("close() called from a source's own look, start or stop function returns, a
       summary: "closes from its start",
       options: {},
       async start() {
+        // After one turn, so the start is already recorded as pending when close() looks for it.
+        await Promise.resolve();
         await host.close();
       },
     });
