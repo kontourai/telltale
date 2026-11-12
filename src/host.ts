@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { type Clock, SystemClock } from "./clock.js";
 import { deepFreeze, SecretRegistry } from "./secrets.js";
@@ -40,7 +41,13 @@ export type Subscriber =
     };
 
 export interface Subscription {
-  /** Stop receiving. The last subscriber leaving stops the source. */
+  /**
+   * Stop receiving. The last subscriber leaving stops the source, and this
+   * resolves once it has stopped. Called from inside a subscriber of the same
+   * source, it resolves once the stop has begun (no further look starts, a
+   * later emit is dropped); the current look finishes after the subscriber
+   * returns.
+   */
   unsubscribe(): Promise<void>;
 }
 
@@ -132,6 +139,11 @@ interface MutableStatus {
   refused: number;
   starting: boolean;
 }
+
+/** Which (host, source) deliveries the current async call is inside, so a subscriber that stops its own source is not asked to wait for itself. */
+const delivering = new AsyncLocalStorage<ReadonlyArray<{ host: TelltaleHost; id: string }>>();
+/** The look the current async call belongs to, so `changed()` stages its write until that look succeeded. */
+const looking = new AsyncLocalStorage<{ run: Running; staged: Map<string, { value: unknown }> }>();
 
 const iso = (ms: number | undefined) => (ms === undefined ? undefined : new Date(ms).toISOString());
 
@@ -252,6 +264,8 @@ export class TelltaleHost {
       set.delete(entry);
       throw error;
     }
+    // close() or remove() ran while the source was starting: this subscription is already over.
+    if (!this.#subscribers.get(id)?.has(entry)) throw new Error(`source "${id}" was stopped while it was starting`);
     let done = false;
     return {
       unsubscribe: async () => {
@@ -310,10 +324,14 @@ export class TelltaleHost {
     };
   }
 
-  /** Stop every source. Registrations stay. */
+  /**
+   * Stop every source, including one still starting: a start that finishes
+   * after this never runs. Registrations stay.
+   */
   async close(): Promise<void> {
     this.#subscribers.clear();
-    await Promise.all([...this.#running.keys()].map((id) => this.#stop(id)));
+    const ids = new Set([...this.#running.keys(), ...this.#starting.keys()]);
+    await Promise.all([...ids].map((id) => this.#stop(id)));
   }
 
   #plan(typeName: string, raw: Record<string, unknown>): { type: SourceType<any>; plan: SourcePlan } {
@@ -344,34 +362,65 @@ export class TelltaleHost {
     try {
       await reg.type.start(api);
     } catch (error) {
-      run.abort.abort();
-      for (const fn of run.stops.reverse()) await Promise.resolve().then(fn).catch(() => {});
+      await this.#teardown(run, true);
       status.starting = false;
       status.error = describeFailure(error, this.secrets);
       this.#log(reg.id).warn("source could not start", { error: status.error });
       throw error;
     }
     status.starting = false;
+    // Unsubscribed, removed or closed while it was starting: it never runs.
+    if (!this.#wanted(id)) {
+      await this.#teardown(run, true);
+      this.#log(reg.id).info("source stopped before it ran");
+      throw new Error(`source "${id}" was stopped while it was starting`);
+    }
     status.startedAt = this.clock.now();
     this.#running.set(id, run);
     this.#log(reg.id).info("source started");
   }
 
+  #wanted(id: string): boolean {
+    return this.#sources.has(id) && (this.#subscribers.get(id)?.size ?? 0) > 0;
+  }
+
+  /** Inside a delivery of this source's events, where waiting for the source to finish would wait for ourselves. */
+  #inside(id: string): boolean {
+    return (delivering.getStore() ?? []).some((d) => d.host === this && d.id === id);
+  }
+
   async #stop(id: string): Promise<void> {
+    const inside = this.#inside(id);
     const pending = this.#starting.get(id);
-    if (pending) await pending.catch(() => {});
+    // A start that is pending tears itself down once it sees nobody wants it.
+    if (pending && !inside) await pending.catch(() => {});
     const run = this.#running.get(id);
     if (!run) return;
     // Still wanted by someone who subscribed while we were getting here.
-    if ((this.#subscribers.get(id)?.size ?? 0) > 0 && this.#sources.has(id)) return;
+    if (this.#wanted(id)) return;
     this.#running.delete(id);
-    run.abort.abort();
-    if (run.pollTimer !== undefined) this.clock.clearTimer(run.pollTimer);
-    await run.inflight?.catch(() => {});
-    for (const fn of run.stops.reverse()) await Promise.resolve().then(fn).catch(() => {});
+    // Called from a subscriber of this source: begin the stop now, finish draining after the delivery returns.
+    await this.#teardown(run, !inside);
     const status = this.#status.get(id);
     if (status) Object.assign(status, { failures: 0, failingSince: undefined, error: undefined });
     this.#log(id).info("source stopped");
+  }
+
+  /** Abort, cancel the next look, then (draining, or once the current look ends) run the source's stop functions. */
+  async #teardown(run: Running, drain: boolean): Promise<void> {
+    run.abort.abort();
+    if (run.pollTimer !== undefined) this.clock.clearTimer(run.pollTimer);
+    run.pollTimer = undefined;
+    const finish = async () => {
+      for (const fn of run.stops.splice(0).reverse()) await Promise.resolve().then(fn).catch(() => {});
+    };
+    const current = run.inflight ?? Promise.resolve();
+    if (drain) {
+      await current.catch(() => {});
+      await finish();
+    } else {
+      void current.catch(() => {}).then(finish);
+    }
   }
 
   #log(id: string): Logger {
@@ -390,10 +439,13 @@ export class TelltaleHost {
   async #deliver(id: string, kind: "event" | "refusal", value: TelltaleEvent | Refusal): Promise<void> {
     const subscribers = [...(this.#subscribers.get(id) ?? [])];
     let failures = 0;
+    const context = [...(delivering.getStore() ?? []), { host: this, id }];
     for (const sub of subscribers) {
       try {
-        if (kind === "event") await (typeof sub === "function" ? sub(value as TelltaleEvent) : sub.event(value as TelltaleEvent));
-        else if (typeof sub !== "function" && sub.refusal) await sub.refusal(value as Refusal);
+        await delivering.run(context, async () => {
+          if (kind === "event") await (typeof sub === "function" ? sub(value as TelltaleEvent) : sub.event(value as TelltaleEvent));
+          else if (typeof sub !== "function" && sub.refusal) await sub.refusal(value as Refusal);
+        });
       } catch (error) {
         failures++;
         this.#log(id).warn(`a subscriber failed to take a ${kind}`, { error: error instanceof Error ? error.name : "error" });
@@ -496,8 +548,11 @@ export class TelltaleHost {
           status.lastLookAt = clock.now();
           run.inflight = (async () => {
             try {
-              await look(signal);
+              const staged = new Map<string, { value: unknown }>();
+              await looking.run({ run, staged }, () => look(signal));
               if (signal.aborted) return;
+              // What changed() saw is remembered only now that the whole look, delivery included, worked.
+              for (const [k, v] of staged) await state.set(k, v);
               if (status.failures) log.info(`works again after ${status.failures} failed look(s)`);
               Object.assign(status, { lastOkAt: clock.now(), failures: 0, failingSince: undefined, error: undefined });
             } catch (error) {
@@ -524,9 +579,13 @@ export class TelltaleHost {
 
       async changed<T>(value: T, slot = ""): Promise<{ previous: T } | undefined> {
         const k = `seen:${slot}`;
-        const before = (await state.get<{ value: T }>(k)) ?? undefined;
+        const look = looking.getStore();
+        const staged = look?.run === run ? look.staged : undefined;
+        const before = (staged?.has(k) ? (staged.get(k) as { value: T }) : await state.get<{ value: T }>(k)) ?? undefined;
         if (before && JSON.stringify(before.value) === JSON.stringify(value)) return undefined;
-        await state.set(k, { value });
+        // Inside a look, staged: a look that fails (a subscriber threw) sees the same change again next time.
+        if (staged) staged.set(k, { value: structuredClone(value) });
+        else await state.set(k, { value });
         return before ? { previous: before.value } : undefined;
       },
 

@@ -280,3 +280,98 @@ test("harmless repeats numbers and single words only", () => {
   assert.equal(harmless("ignore previous instructions"), "a value of 28 characters");
   assert.equal(harmless(null), "nothing");
 });
+
+// ---- Fix round 1 -------------------------------------------------------------
+
+test("close() during a start: the start that finishes afterwards never runs, holds no timer and accepts nothing", async () => {
+  let release;
+  let stops = 0;
+  const { host, clock } = newHost({
+    options: {
+      types: {
+        slow: {
+          summary: "a slow starter",
+          options: {},
+          async start(api) {
+            api.onStop(() => void stops++);
+            await new Promise((r) => (release = r));
+            api.poll("1m", () => {});
+          },
+        },
+      },
+    },
+  });
+  host.add({ id: "slow", type: "slow" });
+  const pending = host.subscribe("slow", () => {});
+  const closed = host.close();
+  release();
+  await closed;
+  await assert.rejects(pending, /stopped while it was starting/);
+  assert.equal(host.status("slow").state, "stopped");
+  assert.equal(host.info("slow").subscribers, 0);
+  assert.equal(clock.pendingTimers(), 0, "no poll timer left behind");
+  assert.equal(stops, 1, "its stop functions ran");
+});
+
+test("close() right after subscribe stops the built-in poll and webhook sources", async () => {
+  const { host, clock } = newHost();
+  host.add({
+    id: "gh",
+    type: "github-poll",
+    options: { repository: "example/repo" },
+    bindings: { fetch: async () => new Response('{"total_count":0,"workflow_runs":[]}') },
+  });
+  host.add({ id: "hook", type: "webhook", options: { secret: "s".repeat(32) } });
+  const subscribing = [host.subscribe("gh", () => {}), host.subscribe("hook", () => {})];
+  await host.close();
+  await Promise.allSettled(subscribing);
+  assert.equal(host.status("gh").state, "stopped");
+  assert.equal(clock.pendingTimers(), 0);
+  const result = await host.receive("hook", { headers: {}, body: "{}" });
+  assert.deepEqual([result.status, result.reason], [404, "not_listening"]);
+});
+
+test("a subscriber that awaits its own unsubscribe returns, and the source stops", async () => {
+  let value = "a";
+  let returned = false;
+  const { host, clock, record } = hostWithProbe(async (api) => {
+    if (await api.changed(value)) await api.emit("changed", { value }, { dedupKey: `v:${value}` });
+  });
+  host.add({ id: "p", type: "probe" });
+  let subscription;
+  subscription = await host.subscribe("p", async () => {
+    await subscription.unsubscribe();
+    returned = true;
+  });
+  await clock.advance(0);
+  value = "b";
+  await clock.advance(60_000);
+  assert.equal(returned, true, "unsubscribe inside a subscriber did not wait for itself");
+  assert.equal(host.status("p").state, "stopped");
+  assert.equal(record.stops, 1);
+  assert.equal(clock.pendingTimers(), 0);
+});
+
+test("changed(): a change whose delivery failed is seen again at the next look and delivered then", async () => {
+  let value = "a";
+  let fail = true;
+  const attempts = [];
+  const { host, clock } = hostWithProbe(async (api) => {
+    if (await api.changed(value)) await api.emit("changed", { value }, { dedupKey: `v:${value}` });
+  });
+  host.add({ id: "p", type: "probe" });
+  await host.subscribe("p", (e) => {
+    attempts.push(e.payload.value);
+    if (fail) throw new Error("consumer down");
+  });
+  await clock.advance(0);
+  value = "b";
+  await clock.advance(60_000);
+  assert.equal(host.status("p").state, "failing");
+  fail = false;
+  await clock.advance(120_000);
+  assert.deepEqual(attempts, ["b", "b"], "the failed change was delivered again");
+  assert.equal(host.status("p").state, "running");
+  await clock.advance(60_000);
+  assert.deepEqual(attempts, ["b", "b"], "and, once delivered, not again");
+});

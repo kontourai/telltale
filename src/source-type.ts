@@ -133,7 +133,9 @@ export interface SourceApi<Bindings = Record<string, unknown>> {
    * Compare a value with what was there at the last look, and remember it.
    * Returns what it was before when it differs. The first look returns
    * nothing: it is the starting point, not a change. An unchanged value
-   * writes nothing. `slot` keeps several values apart.
+   * writes nothing. `slot` keeps several values apart. Inside a look, the
+   * new value is remembered only when the look succeeds (every emit was
+   * taken), so a failed delivery sees the same change at the next look.
    */
   changed<T>(value: T, slot?: string): Promise<{ previous: T } | undefined>;
   /** Private state for this source, namespaced by id, type and non-secret options. */
