@@ -1,0 +1,60 @@
+{
+  "name": "@kontourai/telltale",
+  "version": "0.1.0",
+  "description": "Kontour's event actor: typed event sources (webhook, GitHub poll, folder) that stamp trust from where an event entered, never from what it says, and emit one normalized event. It reports; it never starts work.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kontourai/telltale"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "examples/",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/node/*.test.mjs",
+    "test:node": "node --test tests/node/*.test.mjs",
+    "example": "npm run build && node examples/demo.mjs",
+    "prepack": "npm run build",
+    "docs:check": "npx -y --package=https://codeload.github.com/kontourai/corpus/tar.gz/b127e35a818b532369843731b3c64792baade83e -- corpus check",
+    "docs:build": "npx -y --package=https://codeload.github.com/kontourai/corpus/tar.gz/b127e35a818b532369843731b3c64792baade83e -- corpus build"
+  },
+  "keywords": [
+    "events",
+    "webhook",
+    "hmac",
+    "replay",
+    "polling",
+    "github",
+    "folder-watch",
+    "trust",
+    "kontour"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.25.0",
+  "devDependencies": {
+    "@kontourai/veritas": "1.12.2",
+    "@types/node": "^25.9.2",
+    "typescript": "^6.0.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

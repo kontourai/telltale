@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 2,
+  "purpose": "Turn outside happenings into one normalized, trust-stamped event without taking authority to act on it.",
+  "builtOn": [],
+  "product": "telltale",
+  "title": "Telltale",
+  "tagline": "The Kontour event actor: typed sources that stamp trust at entry and report, never act",
+  "repo": "kontourai/telltale",
+  "landing": "README.md",
+  "documents": [
+    {
+      "source": "docs/getting-started.md",
+      "section": "Start Here"
+    },
+    {
+      "source": "docs/design.md",
+      "section": "Concepts",
+      "title": "Design: contract, semantics and origins",
+      "covers": [
+        "src/host.ts",
+        "src/types.ts",
+        "src/source-type.ts",
+        "src/sources/**"
+      ]
+    },
+    {
+      "source": "CONTEXT.md",
+      "section": "Concepts",
+      "title": "Domain context and vocabulary"
+    },
+    {
+      "source": "docs/adoption/station.md",
+      "section": "Guides",
+      "title": "Adopting Telltale in Station",
+      "covers": [
+        "src/sources/webhook.ts",
+        "src/sources/webhook-guards.ts",
+        "src/sources/github-poll.ts"
+      ]
+    },
+    {
+      "source": "docs/reference.md",
+      "section": "Reference",
+      "covers": [
+        "src/index.ts",
+        "src/**"
+      ]
+    },
+    {
+      "source": "AGENTS.md",
+      "section": "Contribute",
+      "title": "Contributing"
+    }
+  ],
+  "topics": [
+    {
+      "id": "invariants",
+      "title": "Invariants: trust from entry, reports never acts",
+      "source": "CONTEXT.md#invariants"
+    },
+    {
+      "id": "event-envelope",
+      "title": "The normalized event envelope and dedupKey",
+      "source": "docs/design.md#the-event"
+    },
+    {
+      "id": "trust",
+      "title": "How trust is stamped",
+      "source": "docs/design.md#trust"
+    },
+    {
+      "id": "source-types",
+      "title": "Writing a source type",
+      "source": "docs/reference.md#writing-a-source-type"
+    },
+    {
+      "id": "polling-rules",
+      "title": "First look, unchanged look, backoff and status",
+      "source": "docs/design.md#semantics-carried-over-from-pine"
+    },
+    {
+      "id": "webhook",
+      "title": "Webhook verification order, replay and rate limits",
+      "source": "docs/design.md#the-webhook-ported-from-stations-inbound-intake"
+    },
+    {
+      "id": "github-poll",
+      "title": "GitHub workflow-run polling, cursor and normalization",
+      "source": "docs/design.md#the-github-poll-ported-from-stations-github-poll"
+    },
+    {
+      "id": "station-adoption",
+      "title": "Moving Station's intake onto Telltale",
+      "source": "docs/adoption/station.md"
+    },
+    {
+      "id": "troubleshooting",
+      "title": "Troubleshooting",
+      "source": "docs/getting-started.md#troubleshooting"
+    }
+  ],
+  "exclude": []
+}
