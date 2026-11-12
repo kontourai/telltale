@@ -813,3 +813,20 @@ test("close() waits for a webhook subscriber still taking a request, and refuses
   await pending;
   assert.deepEqual(order, ["subscriber done", "request 202", "closed"]);
 });
+
+test("a source subscribed again while close() is draining accepts no request until close() finished", async () => {
+  const { host } = await setup();
+  let finish;
+  await host.subscribe("inbound", () => new Promise((resolve) => (finish = resolve)));
+  const pending = host.receive("inbound", request(BODY));
+  await settle();
+  const closing = host.close();
+  await settle();
+  await collect(host, "inbound"); // restarts the source while the old run still drains
+  const during = await host.receive("inbound", request(BODY));
+  assert.deepEqual([during.status, during.reason], [404, "not_listening"]);
+  finish();
+  await closing;
+  assert.equal((await pending).status, 202);
+  assert.equal((await host.receive("inbound", request(BODY))).status, 202, "once close() finished, it listens again");
+});
