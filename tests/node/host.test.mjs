@@ -503,3 +503,73 @@ test("errors from plan(), add() and subscribe() never carry a secret", async () 
   assert.match(error.message, /cannot connect with \[redacted\]/);
   assert.ok(!`${error.message}\n${error.stack}`.includes(token));
 });
+
+// ---- Fix round 3 -------------------------------------------------------------
+
+test("close() called from a source's own look, start or stop function returns, and an outside close() still drains", async () => {
+  // From inside a look.
+  {
+    let returned = false;
+    const { host, clock } = newHost();
+    host.registerType("p", {
+      summary: "closes from its look",
+      options: {},
+      start(api) {
+        api.poll("1s", async () => {
+          await host.close();
+          returned = true;
+        });
+      },
+    });
+    host.add({ id: "p", type: "p" });
+    await collect(host, "p");
+    await clock.advance(0);
+    assert.equal(returned, true, "close() inside a look waited for that look");
+    assert.equal(host.status("p").state, "stopped");
+    assert.equal(clock.pendingTimers(), 0);
+  }
+  // From inside a stop function, while an outside close() is running.
+  {
+    let returned = false;
+    let closed = false;
+    const { host } = newHost();
+    host.registerType("s", {
+      summary: "closes from its stop function",
+      options: {},
+      start(api) {
+        api.onStop(async () => {
+          await host.close();
+          returned = true;
+        });
+      },
+    });
+    host.add({ id: "s", type: "s" });
+    await collect(host, "s");
+    const closing = host.close().then(() => (closed = true));
+    await settle();
+    assert.equal(returned, true, "close() inside a stop function waited for itself");
+    assert.equal(closed, true);
+    await closing;
+  }
+  // From inside a start.
+  {
+    const { host } = newHost();
+    host.registerType("st", {
+      summary: "closes from its start",
+      options: {},
+      async start() {
+        await host.close();
+      },
+    });
+    host.add({ id: "st", type: "st" });
+    let settled = false;
+    const subscribing = host.subscribe("st", () => {}).then(
+      () => (settled = "resolved"),
+      () => (settled = "rejected"),
+    );
+    await settle();
+    assert.equal(settled, "rejected", "close() inside a start waited for that start");
+    await subscribing;
+    assert.equal(host.status("st").state, "stopped");
+  }
+});

@@ -146,6 +146,9 @@ interface MutableStatus {
 
 /** Which (host, source) deliveries the current async call is inside, so a subscriber that stops its own source is not asked to wait for itself. */
 const delivering = new AsyncLocalStorage<ReadonlyArray<{ host: TelltaleHost; id: string }>>();
+// The same store marks every piece of a source's own work: its start, its looks,
+// its request handler, its deliveries and its stop functions. A stop or close()
+// called from any of them begins the stop and does not wait for its own work.
 /** The look the current async call belongs to, so `changed()` stages its write until that look succeeded. */
 const looking = new AsyncLocalStorage<{ run: Running; staged: Map<string, { value: unknown }> }>();
 
@@ -226,19 +229,20 @@ export class TelltaleHost {
 
   /** Register a source. It does not start until something subscribes. */
   add<B extends Record<string, unknown>>(input: AddSourceInput<B>): SourceInfo {
-    if (typeof input.id !== "string" || !SOURCE_ID.test(input.id)) {
-      throw new Error(`"${input.id}" is not a usable source id (lowercase letters, digits, _ . -, at most 64)`);
-    }
-    if (this.#sources.has(input.id)) throw new Error(`a source with id "${input.id}" exists already`);
-    const trust = input.trust ?? "untrusted";
-    if (trust !== "owner" && trust !== "untrusted") throw new Error(`trust must be "owner" or "untrusted"`);
-    let checked: { type: SourceType<any>; plan: SourcePlan };
+    let checked: { type: SourceType<any>; plan: SourcePlan; trust: Trust };
+    // Every check is inside the boundary: an id, a type name or an option may carry a copy of a secret.
     try {
-      checked = this.#plan(input.type, input.options ?? {});
+      if (typeof input.id !== "string" || !SOURCE_ID.test(input.id)) {
+        throw new Error(`"${input.id}" is not a usable source id (lowercase letters, digits, _ . -, at most 64)`);
+      }
+      if (this.#sources.has(input.id)) throw new Error(`a source with id "${input.id}" exists already`);
+      const trust = input.trust ?? "untrusted";
+      if (trust !== "owner" && trust !== "untrusted") throw new Error(`trust must be "owner" or "untrusted"`);
+      checked = { ...this.#plan(input.type, input.options ?? {}), trust };
     } catch (error) {
-      throw redactError(error, this.#requestSecrets(input.type, input.options ?? {}));
+      throw redactError(error, this.#requestSecrets(input?.type, input?.options ?? {}));
     }
-    const { type, plan } = checked;
+    const { type, plan, trust } = checked;
     const secretKeys = Object.keys(type.options).filter((k) => type.options[k]?.secret === true);
     for (const key of secretKeys) {
       const value = plan.options[key];
@@ -280,7 +284,7 @@ export class TelltaleHost {
    * this rejects and nothing stays subscribed.
    */
   async subscribe(id: string, subscriber: Subscriber): Promise<Subscription> {
-    if (!this.#sources.has(id)) throw new Error(`there is no source "${id}"`);
+    if (!this.#sources.has(id)) throw redactError(new Error(`there is no source "${id}"`), this.secrets);
     let set = this.#subscribers.get(id);
     if (!set) this.#subscribers.set(id, (set = new Set()));
     // A distinct wrapper per call, so the same function subscribed twice is two subscriptions.
@@ -298,11 +302,15 @@ export class TelltaleHost {
     let done = false;
     return {
       unsubscribe: async () => {
-        if (done) return;
-        done = true;
-        const current = this.#subscribers.get(id);
-        current?.delete(entry);
-        if (!current || current.size === 0) await this.#stop(id);
+        // Removing the subscription happens once; joining the stop it caused happens on every call.
+        if (!done) {
+          done = true;
+          const current = this.#subscribers.get(id);
+          current?.delete(entry);
+          if (!current || current.size === 0) return this.#stop(id);
+        }
+        // Already removed (perhaps from inside its own delivery): wait for the drain still running.
+        if (!this.#inside(id)) await this.#drained(id);
       },
     };
   }
@@ -373,8 +381,8 @@ export class TelltaleHost {
   }
 
   /** A registry with the host's secrets and the secret options of one request that was not added (yet). */
-  #requestSecrets(typeName: string, options: unknown): SecretRegistry {
-    const spec = this.#types.get(typeName)?.options;
+  #requestSecrets(typeName: unknown, options: unknown): SecretRegistry {
+    const spec = typeof typeName === "string" ? this.#types.get(typeName)?.options : undefined;
     if (!spec || !options || typeof options !== "object") return this.secrets;
     return this.secrets.with(
       secretValues(spec, options as Record<string, unknown>).filter((v) => v.length >= MIN_SECRET_LENGTH),
@@ -408,7 +416,7 @@ export class TelltaleHost {
     status.starting = true;
     this.#startingRuns.set(id, run);
     try {
-      await reg.type.start(api);
+      await this.#within(id, () => reg.type.start(api));
     } catch (error) {
       await this.#beginStop(id, run);
       status.starting = false;
@@ -436,7 +444,12 @@ export class TelltaleHost {
     return this.#sources.has(id) && (this.#subscribers.get(id)?.size ?? 0) > 0;
   }
 
-  /** Inside a delivery of this source's events, where waiting for the source to finish would wait for ourselves. */
+  /** Run `fn` as this source's own work (see `delivering`). */
+  #within<T>(id: string, fn: () => T): T {
+    return delivering.run([...(delivering.getStore() ?? []), { host: this, id }], fn);
+  }
+
+  /** Inside this source's own work (a delivery, a look, its start, its request handler, a stop function), where waiting for the source to finish would wait for ourselves. */
   #inside(id: string): boolean {
     return (delivering.getStore() ?? []).some((d) => d.host === this && d.id === id);
   }
@@ -480,7 +493,7 @@ export class TelltaleHost {
     run.drained = (async () => {
       await (run.inflight ?? Promise.resolve()).catch(() => {});
       await Promise.allSettled([...run.active]);
-      for (const fn of run.stops.splice(0).reverse()) await Promise.resolve().then(fn).catch(() => {});
+      for (const fn of run.stops.splice(0).reverse()) await this.#within(id, () => Promise.resolve().then(fn)).catch(() => {});
     })().finally(() => {
       draining.delete(run);
       if (draining.size === 0 && this.#draining.get(id) === draining) this.#draining.delete(id);
@@ -620,7 +633,7 @@ export class TelltaleHost {
           run.inflight = Promise.resolve().then(async () => {
             try {
               const staged = new Map<string, { value: unknown }>();
-              await looking.run({ run, staged }, () => look(signal));
+              await host.#within(reg.id, () => looking.run({ run, staged }, () => look(signal)));
               if (signal.aborted) return;
               // What changed() saw is remembered only now that the whole look, delivery included, worked.
               for (const [k, v] of staged) await state.set(k, v);
@@ -677,7 +690,7 @@ export class TelltaleHost {
         run.receive = async (request) => {
           if (run.abort.signal.aborted) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
           // Tracked, so a stop waits for this request to finish.
-          const handling = handler(request);
+          const handling = host.#within(reg.id, () => handler(request));
           run.active.add(handling);
           try {
             return await handling;
@@ -697,9 +710,11 @@ export class TelltaleHost {
 /** An error safe to hand back through a public method: the same message with every secret redacted, nothing else attached. */
 function redactError(error: unknown, secrets: SecretRegistry): Error {
   const message = secrets.text(error instanceof Error ? error.message : String(error));
-  if (error instanceof SourceError) return new SourceError(message);
-  const clean = new Error(message);
-  if (error instanceof Error) clean.name = error.name;
+  const clean = error instanceof SourceError ? new SourceError(message) : new Error(message);
+  // The name is redacted too, and set before the stack is first read, which formats the
+  // stack's first line from it; the stack is then redacted once more as a whole.
+  if (error instanceof Error && !(error instanceof SourceError)) clean.name = secrets.text(String(error.name));
+  clean.stack = secrets.text(String(clean.stack));
   return clean;
 }
 
