@@ -1,0 +1,18 @@
+# Dependency install scripts are blocked by default (pnpm >= 10). Only the
+# packages listed here, at exactly these versions, may run a build script.
+# Nothing in this dependency tree needs one. Bump the pin with the dep.
+allowBuilds: {}
+
+# Third-party releases must be at least 24 hours old, including during frozen
+# installs: pnpm checks lockfile entries against supply-chain policies.
+# Internal @kontourai releases are exempt below. Urgent third-party security
+# patches require an explicit name@version exception with a commit rationale.
+minimumReleaseAge: 1440
+
+# Internal releases are available immediately; third-party packages still age.
+minimumReleaseAgeExclude:
+  - '@kontourai/*'
+
+# mise supplies node and pnpm on developer machines; CI installs the exact
+# version pinned in package.json. Do not reject a same-major pnpm from mise.
+pmOnFail: ignore

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tgz
+.DS_Store
+.telltale/
+*.local.json
+.kontourai/
+dist-pages/
