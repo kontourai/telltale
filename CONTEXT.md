@@ -34,7 +34,7 @@ Telltale is the Kontour suite's event actor. Its role is to turn what happens el
 - **Look:** One run of a polling source. **Backoff:** the wait doubling after each failed look, capped at 15 minutes (or the interval if longer).
 - **Status:** `stopped | starting | running | failing`, last look and last success, failures, a safe error, the source's note, emitted and refused counts.
 - **StateStore:** Telltale-private durable bookkeeping (cursors, last-seen values), namespaced per source and configuration. In-memory by default.
-- **Replay ledger / Audit / Budget:** The webhook's pluggable guards: keys of authenticated requests, reserved then committed on delivery or released on failure (fail closed); refusal records without bodies or secrets; and the global unauthenticated budget, which admits requests and counts those in flight. Unbound, they live with the registration, not a subscription.
+- **Replay ledger / Audit / Budget:** The webhook's pluggable guards: keys of authenticated requests, reserved with an ownership token, extended while delivery runs, then committed on delivery or released on failure (fail closed); refusal records without bodies or secrets; and the global unauthenticated budget, which admits requests and counts those in flight. Unbound, they live with the registration, not a subscription.
 
 ## Boundary
 

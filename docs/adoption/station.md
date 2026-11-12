@@ -54,14 +54,20 @@ host.add({
         return { enabled: true, credential: token && { id: token.id, secret: token.secret, revokedAt: token.revokedAt } };
       },
     },
-    // InboundWebhookReplayStore grows a state per entry: reserve is today's
-    // claim writing "reserved"; commit marks it "delivered"; release deletes a
-    // "reserved" entry. Its `expiresAt > now` liveness already matches the
-    // expiresAt Telltale passes (the first instant the request is stale).
+    // InboundWebhookReplayStore grows a state and an owner token per entry,
+    // each method one read-modify-write of the file under its lock:
+    // - reserve: today's claim, writing { state: "reserved", token: randomUUID() }
+    //   and returning { outcome: "reserved", token } (or { outcome: "replayed" });
+    // - extend / commit / release: act only when the entry's token matches,
+    //   and return whether they did (extend moves expiresAt later, commit sets
+    //   "delivered", release deletes a "reserved" entry).
+    // Its `expiresAt > now` liveness already matches the expiresAt Telltale
+    // passes (the first instant the key is free again).
     replay: {
       reserve: (key, expiresAt, now) => replayStore.reserve(key, expiresAt, now),
-      commit: (key) => replayStore.commit(key),
-      release: (key) => replayStore.release(key),
+      extend: (key, token, expiresAt, now) => replayStore.extend(key, token, expiresAt, now),
+      commit: (key, token) => replayStore.commit(key, token),
+      release: (key, token) => replayStore.release(key, token),
     },
     audit: { record: (e) => auditStore.record(e.reason, e.credentialId) /* or recordAggregatedNoise(e.count) */ },
     budget, // shared with a future /api/webhooks/github/:sourceId route
@@ -185,6 +191,14 @@ store, as the authorization service does today.
 - **The replay store should refuse when full.** `InboundWebhookReplayStore`
   keeps the newest 10,000 keys, dropping live ones. Make `reserve` throw at
   capacity (Telltale answers `policy_unavailable`) instead.
+- **The replay store must be atomic per key.** Each method reads, decides and
+  writes under one lock; a read, an `await` and a write would let two copies
+  of a request both reserve. `extend`, `commit` and `release` compare the
+  owner token in that same step, so a holder whose reservation lapsed cannot
+  touch a newer one.
+- **Bound the body read.** `readBoundedBody` should also stop after a
+  deadline: a request holds room in the shared budget until it authenticates,
+  so a sender that never finishes its body would otherwise hold it.
 - **One boundary for freshness and replay.** Today a replay at exactly
   `timestamp + 5 min` is fresh while its key has expired. Through Telltale the
   key lives until the first stale instant.

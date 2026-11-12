@@ -26,7 +26,7 @@ Everything below is exported from `@kontourai/telltale` (`src/index.ts`).
 | `remove(id)` | Stops and unregisters. State stays, keyed by configuration. |
 | `info(id)`, `list()` | `SourceInfo`: id, type, trust, options (secret options masked, other copies of secrets redacted), subscriber count, status. |
 | `status(id)` | `SourceStatus` (below). |
-| `close()` | Stops every source, including one still starting: a start that finishes afterwards never runs. |
+| `close()` | Stops every source, including one still starting (its `api.signal` is aborted; a start that finishes afterwards never runs) and one already stopping. Resolves once every source drained: current looks and requests finished, stop functions ran. Refuses requests while it runs. |
 | `secrets` | The `SecretRegistry`. `secrets.add(value)` redacts a value of your own. |
 
 A subscriber is a function `(event) => void | Promise<void>` or an object
@@ -126,17 +126,21 @@ Guards: `InMemoryReplayLedger(maxEntries = 10000)` (throws
 and budget are kept with the registration (`api.keep`), so an unsubscribe
 resets none of them; `remove()` drops them.
 
-`ReplayLedger`: `reserve(key, expiresAt, now)` → `"reserved" | "replayed"`,
-atomic per key; `commit(key, now)` once every subscriber took the event;
-`release(key, now)` when delivery failed, so the same request can be sent
-again. A reserved or delivered key refuses another `reserve`. `expiresAt` is
-the first instant the request is no longer accepted: keep the key while
-`now < expiresAt`. Throw when you cannot decide (the request is refused
-`policy_unavailable`).
+`ReplayLedger`: `reserve(key, expiresAt, now)` → `{ outcome: "reserved", token }`
+or `{ outcome: "replayed" }`, atomic per key; `extend(key, token, expiresAt, now)`
+while delivery runs; `commit(key, token, now)` once every subscriber took the
+event; `release(key, token, now)` when delivery failed, so the same request
+can be sent again. `extend`, `commit` and `release` act only when the token
+still owns the key, atomically with that check, and return whether they did.
+A reserved or delivered key refuses another `reserve`. `expiresAt` is the
+first instant the key is free again: keep it while `now < expiresAt`. Throw
+when you cannot decide (the request is refused `policy_unavailable`).
+`ReplayReservation` is the type `reserve` returns.
 
 `UnauthenticatedBudget`: `admit(now)` before any work on a request (false:
 refuse it, no lookup), `release()` once that request authenticated or ended,
-`fail(now)` per refusal. Requests in flight count against the budget. A
+`fail(now)` per refusal. Requests in flight count against the budget, until
+they authenticate or the source stops; give your body reader a deadline. A
 consumer that refuses a request Telltale accepted calls `fail` too.
 `FailureBudget` adds `failures(now)`, `inflight` and `tripped(now)`.
 

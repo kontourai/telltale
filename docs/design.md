@@ -117,13 +117,27 @@ its last; `receive` on a source with no subscriber is `404 not_listening`, so
 an unsubscribed webhook accepts nothing.
 
 A start in progress is covered too. When `close()`, `remove()` or the last
-unsubscribe happens while a source is starting, the start tears itself down
-when it finishes, publishes no running instance and leaves no timer; the
-`subscribe()` that was waiting rejects. Stopping is split into beginning
-(abort, cancel the next look) and draining (wait for the current look, run
-the stop functions). A subscriber that unsubscribes from inside a delivery
-of the same source gets the first part and returns; the drain finishes after
-the delivery, so it never waits for itself.
+unsubscribe happens while a source is starting, its `api.signal` is aborted
+first (a start waiting on it ends now), and the start tears itself down when
+it finishes, publishes no running instance and leaves no timer; the
+`subscribe()` that was waiting rejects.
+
+Stopping is split into beginning (abort, cancel the next look) and draining
+(wait for the current look and every request a receiving source is still
+handling, then run the stop functions). A run stays tracked from the moment
+its stop began until it drained. `close()`, `remove()` and an unsubscribe
+resolve only once every drain of that source finished, including one a
+subscriber began earlier; `close()` refuses new requests while it runs. The
+one exception is a call made from inside a delivery of the same source: it
+begins the stop and returns, because the drain includes the delivery it is
+made from. A webhook's own waits on things outside Telltale (the credential
+store, the body, the ledger) end when the source stops, so a stop never
+waits on a body that never arrives; subscribers are waited for, since a
+delivery in progress is work to finish, not to drop.
+
+Errors thrown by `plan()`, `add()` and `subscribe()` carry their message with
+every secret redacted, the request's own secret options included, and nothing
+else attached.
 
 State is namespaced by source id plus a fingerprint of the type and its
 non-secret options: re-adding the same configuration resumes its cursor; a
@@ -181,9 +195,11 @@ chose it):
    lookups than the budget allows. Once spent: no credential lookup, no
    per-request audit; refusals are aggregated into one `unauthenticated_flood`
    entry per minute. A valid signed request is refused too: the disclosed
-   availability trade. A request holds its admission until it authenticates,
-   so the consumer's own body-read deadline bounds how long a slow sender can
-   hold one.
+   availability trade. A request holds its admission until it authenticates
+   or the source stops. **Give the body reader a deadline:** a sender that
+   never finishes its body holds an admission for as long as the consumer's
+   transport keeps reading, and enough of them refuse everyone else
+   `rate_limited`.
 2. Per-credential attempts (default 60/min, keyed by a digest of the presented
    id, at most 1,024 tracked), with `retryAfterSeconds`.
 3. Credential lookup on every request (revocation and the off switch apply to
@@ -206,11 +222,25 @@ chose it):
    check then `timingSafeEqual`.
 7. Replay reservation, only after a valid signature, so an unauthenticated
    caller cannot burn a key. The key is built only from what the credential
-   authenticated (below). The ledger reserves it atomically; it is committed
+   authenticated (below). The ledger reserves it atomically and returns an
+   ownership token; while delivery runs the reservation is extended (at half
+   its remaining life, by at least a minute), so a subscriber slower than the
+   key's lifetime never lets an identical request reserve it. It is committed
    once every subscriber took the event and released when delivery failed, so
    the identical request sent again is delivered, while a copy arriving during
-   delivery is refused `replay`. A ledger that throws, or is full of live
-   keys, refuses `policy_unavailable`.
+   delivery is refused `replay`. Extend, commit and release act only for the
+   owning token: if a reservation did lapse (the ledger could not extend
+   it), its first holder cannot commit or release the newer holder's, and the
+   mismatch is logged (`replay_commit_not_owned`, `replay_release_not_owned`).
+   A ledger that throws, answers in another shape, or is full of live keys,
+   refuses `policy_unavailable`.
+
+**What a pluggable ledger must guarantee.** `reserve` checks and takes the key
+in one atomic step (a transaction, a compare-and-set, a unique insert); a read,
+an await and a write lets two concurrent copies both reserve and both be
+delivered. `extend`, `commit` and `release` compare
+the token and change the entry in the same atomic step. A holder that stopped
+(a crash) keeps its reservation until its last `expiresAt`.
 8. Emit `received` `{ credentialId, body, headers }`. The body is parsed as
    JSON (strict UTF-8) or carried as `{ text }`. Only allow-listed headers are
    kept; credential-bearing headers cannot be added to that list.
