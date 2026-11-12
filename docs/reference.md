@@ -19,14 +19,14 @@ Everything below is exported from `@kontourai/telltale` (`src/index.ts`).
 | --- | --- |
 | `registerType(name, type)` | Adds a source type. A taken name is refused. |
 | `types()` | Registered type names. |
-| `plan(type, options)` | What adding would do, without adding. Secrets masked. Throws for what cannot work. |
+| `plan(type, options)` | What adding would do, without adding. Secret options masked, and a copy of a secret anywhere else in the plan redacted. Throws for what cannot work. |
 | `add({ id, type, options?, trust?, bindings? })` | Registers a source. `trust` defaults to `untrusted`. Does not start it. |
-| `subscribe(id, subscriber)` | Starts the source on the first subscriber. Resolves to `{ unsubscribe() }`. Rejects, subscribing nothing, if it cannot start. |
+| `subscribe(id, subscriber)` | Starts the source on the first subscriber. Resolves to `{ unsubscribe() }`. Rejects, subscribing nothing, if it cannot start, or if `close()` or `remove()` ran while it was starting. `unsubscribe()` called from inside a subscriber of the same source resolves once the stop has begun; the current look finishes after the subscriber returns. |
 | `receive(id, request)` | Hands a request to a receiving source. Resolves to a `ReceiveResult`. |
 | `remove(id)` | Stops and unregisters. State stays, keyed by configuration. |
-| `info(id)`, `list()` | `SourceInfo`: id, type, trust, masked options, subscriber count, status. |
+| `info(id)`, `list()` | `SourceInfo`: id, type, trust, options (secret options masked, other copies of secrets redacted), subscriber count, status. |
 | `status(id)` | `SourceStatus` (below). |
-| `close()` | Stops every source. |
+| `close()` | Stops every source, including one still starting: a start that finishes afterwards never runs. |
 | `secrets` | The `SecretRegistry`. `secrets.add(value)` redacts a value of your own. |
 
 A subscriber is a function `(event) => void | Promise<void>` or an object
@@ -69,7 +69,13 @@ host.registerType("my-type", type);
 `SourceApi`: `id`, `type`, `options`, `bindings`, `clock`, `log`, `signal`,
 `state.{get,set,delete}`, `emit(name, payload, { dedupKey, deliveryId?, occurredAt?, cause? })`,
 `refuse(reason, { dedupKey? })`, `poll(every, look)`, `changed(value, slot?)`,
-`secret(value)`, `status(note)`, `onReceive(handler)`, `onStop(fn)`.
+`keep(name, create)`, `secret(value)`, `status(note)`, `onReceive(handler)`, `onStop(fn)`.
+
+`changed()` inside a look remembers the new value only when the look succeeds,
+so a change whose delivery failed is seen again at the next look. `keep()`
+returns an object that lives as long as the registration, across
+unsubscribe and resubscribe: the place for guards whose memory must outlast a
+subscription.
 
 Errors: `SourceError` (fixed text that may reach a status line),
 `SourceStoppedError` (emit after stop), `DeliveryError` (a subscriber threw).
@@ -95,8 +101,17 @@ credential id when `credentials` is bound; `signed-body` uses
 `x-hub-signature-256` and `x-github-delivery`; `bearer` uses `authorization`.
 Without a token header the credential id is the source id.
 
-Event `received`: `{ credentialId, body, headers }`. `dedupKey` is
-`delivery:<digest>` with a delivery id, else `request:<digest>`.
+Event `received`: `{ credentialId, body, headers }`. `body` is the parsed JSON
+(strict UTF-8), else `{ text }`, else `{ bytes: <length> }`. `deliveryId` is the
+delivery header when one is configured: transport metadata, never identity.
+
+Replay identity comes only from what the credential authenticated:
+
+| Scheme | Replay key | Kept | `dedupKey` |
+| --- | --- | --- | --- |
+| `signed-timestamp` | (credential, timestamp, nonce) | until the request is stale | `request:<digest>` |
+| `signed-body` | (credential, digest of the signed body) | `retentionHours` | `request:<digest>` |
+| `bearer` | (credential, delivery id) when a delivery header is configured: folds duplicates, no replay protection | `retentionHours` | `delivery:<digest>`, else a random `request:<digest>` |
 
 Reasons (`WEBHOOK_REFUSAL_REASONS`): `disabled` 403, `unknown_token` 401,
 `revoked_token` 403, `malformed_request` 400, `stale_timestamp` 403,
@@ -107,7 +122,23 @@ Reasons (`WEBHOOK_REFUSAL_REASONS`): `disabled` 403, `unknown_token` 401,
 Guards: `InMemoryReplayLedger(maxEntries = 10000)` (throws
 `ReplayLedgerFullError` when full of live keys), `InMemoryWebhookAudit(maxEntries = 256)`,
 `FailureBudget(maxFailures, windowMs)`, `AttemptLimiter(maxAttempts, windowMs, maxTracked)`,
-`MIN_WEBHOOK_SECRET_LENGTH` (32).
+`MIN_WEBHOOK_SECRET_LENGTH` (32). Unbound, the replay ledger, audit, limiter
+and budget are kept with the registration (`api.keep`), so an unsubscribe
+resets none of them; `remove()` drops them.
+
+`ReplayLedger`: `reserve(key, expiresAt, now)` → `"reserved" | "replayed"`,
+atomic per key; `commit(key, now)` once every subscriber took the event;
+`release(key, now)` when delivery failed, so the same request can be sent
+again. A reserved or delivered key refuses another `reserve`. `expiresAt` is
+the first instant the request is no longer accepted: keep the key while
+`now < expiresAt`. Throw when you cannot decide (the request is refused
+`policy_unavailable`).
+
+`UnauthenticatedBudget`: `admit(now)` before any work on a request (false:
+refuse it, no lookup), `release()` once that request authenticated or ended,
+`fail(now)` per refusal. Requests in flight count against the budget. A
+consumer that refuses a request Telltale accepted calls `fail` too.
+`FailureBudget` adds `failures(now)`, `inflight` and `tripped(now)`.
 
 ## github-poll
 
@@ -130,8 +161,12 @@ Functions: `normalizeGitHubWorkflowRun(run, { repository, receivedAt, maxEventAg
 
 Options: `dir` (required, absolute), `mask`, `pattern`, `ignore`,
 `recursive` (true), `every` (at least `"1s"`, default `"5s"`), `maxFiles`
-(10000). Events `added` and `changed`, payload `{ file, size }`, `file`
-relative to `dir` with `/` separators. `maskTest(mask)` is exported.
+(10000), `maxDirectories` (1000), `maxDepth` (32), `maxEntries` (100000,
+every directory entry read, ignored ones included). A scan over any bound
+fails; it never truncates. The folder's device and inode are pinned at
+start, and a scan that finds it, or a folder inside it, replaced fails.
+Events `added` and `changed`, payload `{ file, size }`, `file` relative to
+`dir` with `/` separators. `maskTest(mask)` is exported.
 
 ## Clocks, state, helpers
 

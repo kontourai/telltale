@@ -115,4 +115,9 @@ Status lines never carry outside text, so they are safe to show to an agent.
 - **A polling source reports nothing on its first look.** That is the rule;
   use `backfill` for GitHub if you want the window.
 - **`rate_limited` for a valid request.** The unauthenticated budget tripped
-  after many refused requests; it clears when the minute passes.
+  after many refused requests, or too many requests were still
+  authenticating at once; it clears when the minute passes.
+- **`replay` for a request you never delivered.** A copy of it is being
+  delivered right now, or a `signed-body` sender sent byte-identical bodies
+  for two different happenings. A request whose delivery failed (`503
+  delivery_failed`) is not a replay: send it again.

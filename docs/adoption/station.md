@@ -31,6 +31,7 @@ One host per Station process; one webhook source for `/inbound`:
 import { TelltaleHost, FailureBudget } from "@kontourai/telltale";
 
 const host = new TelltaleHost({ logger });
+// Shared by Telltale (admission and its own refusals) and by the route (refusals after acceptance).
 const budget = new FailureBudget(INBOUND_WEBHOOK_UNAUTHENTICATED_BUDGET_MAX_ATTEMPTS, 60_000);
 host.add({
   id: "inbound",
@@ -53,7 +54,15 @@ host.add({
         return { enabled: true, credential: token && { id: token.id, secret: token.secret, revokedAt: token.revokedAt } };
       },
     },
-    replay: { claim: (key, expiresAt, now) => replayStore.claim(key, expiresAt, now) },
+    // InboundWebhookReplayStore grows a state per entry: reserve is today's
+    // claim writing "reserved"; commit marks it "delivered"; release deletes a
+    // "reserved" entry. Its `expiresAt > now` liveness already matches the
+    // expiresAt Telltale passes (the first instant the request is stale).
+    replay: {
+      reserve: (key, expiresAt, now) => replayStore.reserve(key, expiresAt, now),
+      commit: (key) => replayStore.commit(key),
+      release: (key) => replayStore.release(key),
+    },
     audit: { record: (e) => auditStore.record(e.reason, e.credentialId) /* or recordAggregatedNoise(e.count) */ },
     budget, // shared with a future /api/webhooks/github/:sourceId route
   },
@@ -62,7 +71,56 @@ host.add({
 await host.subscribe("inbound", () => {});
 ```
 
+### The payload validator
+
+Telltale hands over the body already decoded: strict UTF-8, then
+`JSON.parse`. Station's `parsePayload(bytes)` decodes and checks the shape in
+one function, so it cannot take `event.payload.body`. Split it; the route
+uses the shape half:
+
+```ts
+// Unchanged callers that still hold bytes keep this.
+function parsePayload(bytes: Uint8Array): WebhookPayload | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    return null;
+  }
+  return payloadFrom(value);
+}
+
+// The shape check, on a decoded value: what the Telltale route calls.
+function payloadFrom(value: unknown): WebhookPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.agent !== "string" ||
+    !candidate.agent.trim() ||
+    typeof candidate.message !== "string" ||
+    !candidate.message.trim() ||
+    candidate.message.length > 200_000 ||
+    (candidate.project !== undefined && (typeof candidate.project !== "string" || !candidate.project.trim()))
+  ) {
+    return null;
+  }
+  return {
+    agent: candidate.agent.trim(),
+    message: candidate.message,
+    ...(typeof candidate.project === "string" ? { project: candidate.project.trim() } : {}),
+  };
+}
+```
+
+A body that is not JSON reaches Station as `{ text }` (or `{ bytes }` when it
+is not UTF-8), which `payloadFrom` refuses like any other wrong shape.
+
 ### The route
+
+Telltale charges the budget and writes the audit entry for every refusal it
+makes. A refusal Station makes after Telltale accepted (a malformed payload,
+an invalid target, a forbidden start) must do the same by hand, exactly as the
+route does today, and `accepted` is recorded only once the turn started:
 
 ```ts
 app.post("/inbound", async (c) => {
@@ -71,36 +129,72 @@ app.post("/inbound", async (c) => {
     headers: c.req.raw.headers,
     body: () => readBoundedBody(c.req.raw), // called only after header checks pass
   });
-  recordOutcome(result.accepted ? "accepted" : result.reason);
   if (!result.accepted) {
+    // Budget and audit were already charged by Telltale; only the metric is Station's.
+    recordOutcome(result.reason);
     if (result.retryAfterSeconds) c.header("Retry-After", String(result.retryAfterSeconds));
     return c.json({ success: false, code: result.reason, retryable: result.retryable }, result.status);
   }
   const { credentialId, body } = result.event.payload;
-  const payload = parsePayload(body);           // Station's {agent, message, project} validation
-  if (!payload) return malformed();
-  if (!grantAllows(tokenGrants(credentialId), payload.agent, payload.project)) return forbiddenStart(credentialId);
-  // ... startTurn, recordSuccess(credentialId, conversationId), 202 — unchanged
+  // A refusal after acceptance: the same budget, audit and outcome as today.
+  const refuse = (reason: "malformed_request" | "forbidden_start", status: 400 | 403, tokenId?: string) => {
+    budget.fail(Date.now());
+    auditStore.record(reason, tokenId);
+    recordOutcome(reason);
+    options.logger.warn("Inbound webhook refused", { reason });
+    return c.json({ success: false, code: reason, retryable: false }, status);
+  };
+  const payload = payloadFrom(body);
+  // Today's authorization.recordFailure('malformed_request') records no token id; keep that.
+  if (!payload) return refuse("malformed_request", 400);
+  let target: ExecutionTarget;
+  try {
+    target = targetFor(payload);
+  } catch {
+    return refuse("malformed_request", 400);
+  }
+  if (!grantAllows(tokenGrants(credentialId), payload.agent, payload.project)) {
+    return refuse("forbidden_start", 403, credentialId);
+  }
+  // ... startTurn, then recordSuccess(credentialId, conversationId) and
+  // recordOutcome("accepted"), 202; the turn_start_failed and managed-ceiling
+  // branches are unchanged.
 });
 ```
 
+`tokenGrants(credentialId)` reads the token's `starts` from the configuration
+store, as the authorization service does today.
+
 ### Behavior changes to expect
 
-- **A forbidden start consumes its nonce.** Telltale claims the nonce after
-  the signature holds, before Station's grant check. A caller retrying the
+- **A forbidden start consumes its nonce.** Telltale commits the nonce once
+  the event is delivered, before Station's grant check. A caller retrying the
   same signed request after fixing the grant must re-sign. Stricter; no
   current Station test retries a forbidden nonce.
+- **A turn that fails to start still consumes its nonce,** as today: the turn
+  starts in the route, after Telltale delivered. To make `turn_start_failed`
+  retryable with the same signed request, start the turn inside the
+  subscriber and throw on failure; Telltale then releases the reservation
+  and answers `503 delivery_failed`.
 - **Malformed JSON with a bad signature is now `invalid_signature`.** Station
   parsed before verifying; Telltale verifies first. A malformed body with a
-  valid signature is still Station's `malformed_request`, from its own
-  `parsePayload`.
+  valid signature is still Station's `malformed_request`, from `payloadFrom`.
+- **A webhook secret quoted in a message is redacted.** The event payload is
+  redacted, so a message that contains a token's secret reaches the turn as
+  `[redacted]`.
 - **The replay store should refuse when full.** `InboundWebhookReplayStore`
-  keeps the newest 10,000 keys, dropping live ones. Make it throw at capacity
-  (Telltale answers `policy_unavailable`) instead.
-- **Budget construction.** Tests that inject a `RuntimeAuthFailureLimiter`
-  into the route inject a Telltale `FailureBudget` (or a two-method adapter
-  over the limiter: `tripped(now)` / `fail(now)`). The H1 pin test keeps
-  asserting Station's constant.
+  keeps the newest 10,000 keys, dropping live ones. Make `reserve` throw at
+  capacity (Telltale answers `policy_unavailable`) instead.
+- **One boundary for freshness and replay.** Today a replay at exactly
+  `timestamp + 5 min` is fresh while its key has expired. Through Telltale the
+  key lives until the first stale instant.
+- **Budget construction and admission.** Tests that inject a
+  `RuntimeAuthFailureLimiter` into the route inject a Telltale `FailureBudget`
+  (or an adapter with `admit(now)`, `release()` and `fail(now)`). Requests
+  still authenticating count against the budget, so at most the budget's
+  size can be in verification at once; the rest are refused `rate_limited`
+  without a configuration read. The H1 pin test keeps asserting Station's
+  constant.
 - **Noise aggregation moves.** The post-trip `unauthenticated_flood` entry is
   written through the `audit` binding by Telltale's aggregator; Station's
   `InboundWebhookNoiseAggregator` can be removed or kept as the audit-side

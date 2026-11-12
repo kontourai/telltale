@@ -55,11 +55,12 @@ These are enforced in code and each has a test that fails without it.
   reach a status line; any other failure reads "unexpected failure".
 - **Secrets stay out.** Options marked `secret`, and webhook credentials, are
   redacted from events, refusals, status lines and logs, and masked in
-  listings.
+  plans and listings.
 - **Webhooks verify before they read.** Header-only checks run before the
-  body is read; the HMAC is over the raw bytes, compared in constant time; a
-  nonce is claimed only after the signature holds; the replay ledger and the
-  credential store fail closed.
+  body is read; the HMAC is over the raw bytes, compared in constant time;
+  replay is keyed only on signed bytes and reserved only after the signature
+  holds; a failed delivery frees its key for a retry; the replay ledger and
+  the credential store fail closed.
 
 ## Sources in this slice
 
@@ -67,7 +68,7 @@ These are enforced in code and each has a test that fails without it.
 | --- | --- | --- |
 | `webhook` | `received` `{ credentialId, body, headers }` | Transport-agnostic: your HTTP server passes the raw request to `host.receive()`. Schemes `signed-timestamp`, `signed-body` (GitHub), `bearer`. Replay ledger, per-credential limit, global unauthenticated budget. |
 | `github-poll` | `workflow_run.completed` (allow-listed string fields) | One bounded page per poll, a cursor with overlap, freshness bound, refusals with closed reasons. The normalizer and cursor step are exported as pure functions. |
-| `folder` | `added`, `changed` `{ file, size }` | Scans on the host's poll; a file counts once two scans agree. Never follows links. |
+| `folder` | `added`, `changed` `{ file, size }` | Scans on the host's poll; a file counts once two scans agree. Never follows links; pins the folder's identity; bounded by files, folders, depth and entries. |
 
 MQTT, chat bots, FTP, HTTP polling and command sources are later slices.
 
