@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { SourceError, harmless } from "../../dist/index.js";
+import { SourceError, harmless, settle } from "../../dist/index.js";
 import { newHost, collect } from "./helpers.mjs";
 
 /** A source type whose behavior the test drives from outside. */
@@ -401,4 +401,101 @@ test("a source closed from inside a delivery made during its own start never run
   );
   assert.equal(host.status("eager").state, "stopped");
   assert.equal(clock.pendingTimers(), 0);
+});
+
+// ---- Fix round 2 -------------------------------------------------------------
+
+test("close() aborts a start that waits on api.signal, and waits for it", async () => {
+  let signal;
+  let stops = 0;
+  const { host } = newHost({
+    options: {
+      types: {
+        starting: {
+          summary: "waits for its signal",
+          options: {},
+          async start(api) {
+            signal = api.signal;
+            api.onStop(() => void stops++);
+            await new Promise((resolve) => api.signal.addEventListener("abort", resolve, { once: true }));
+          },
+        },
+      },
+    },
+  });
+  host.add({ id: "s", type: "starting" });
+  const starting = host.subscribe("s", () => {});
+  starting.catch(() => {});
+  await settle();
+  await host.close();
+  assert.equal(signal.aborted, true);
+  assert.equal(stops, 1);
+  await assert.rejects(starting, /stopped while it was starting/);
+  assert.equal(host.status("s").state, "stopped");
+  assert.equal(host.status("s").error, undefined, "a stop is not a start failure");
+});
+
+test("close() drains a run whose subscriber began stopping it and is still blocked", async () => {
+  let release;
+  let returned = false;
+  let stops = 0;
+  const { host, clock } = newHost({
+    options: {
+      types: {
+        p: {
+          summary: "poll",
+          options: {},
+          start(api) {
+            api.onStop(() => void stops++);
+            api.poll("1s", () => api.emit("tick", {}, { dedupKey: "tick" }));
+          },
+        },
+      },
+    },
+  });
+  host.add({ id: "p", type: "p" });
+  let sub;
+  sub = await host.subscribe("p", async () => {
+    await sub.unsubscribe();
+    await new Promise((resolve) => (release = resolve));
+    returned = true;
+  });
+  await clock.advance(0);
+  let closed = false;
+  const closing = host.close().then(() => (closed = true));
+  await settle();
+  assert.equal(closed, false, "close() waits for the blocked delivery");
+  assert.equal(stops, 0);
+  release();
+  await closing;
+  assert.equal(returned, true);
+  assert.equal(stops, 1, "stop functions ran before close() resolved");
+});
+
+test("errors from plan(), add() and subscribe() never carry a secret", async () => {
+  const token = randomBytes(20).toString("hex");
+  const { host } = newHost();
+  const options = { repository: "example/repo", token, workflowFiles: [token] };
+  for (const call of [() => host.plan("github-poll", options), () => host.add({ id: "gh", type: "github-poll", options })]) {
+    let error;
+    try {
+      call();
+    } catch (e) {
+      error = e;
+    }
+    assert.ok(error, "it threw");
+    assert.ok(error.message.includes("[redacted]"), "the check reached the copied secret");
+    assert.ok(!`${error.message}\n${error.stack}`.includes(token), "the secret leaked from an error");
+  }
+  host.registerType("leaky", {
+    summary: "throws with its secret",
+    options: { key: { type: "string", secret: true, description: "a secret" } },
+    start(api) {
+      throw new Error(`cannot connect with ${api.options.key}`);
+    },
+  });
+  host.add({ id: "l", type: "leaky", options: { key: token } });
+  const error = await host.subscribe("l", () => {}).catch((e) => e);
+  assert.match(error.message, /cannot connect with \[redacted\]/);
+  assert.ok(!`${error.message}\n${error.stack}`.includes(token));
 });

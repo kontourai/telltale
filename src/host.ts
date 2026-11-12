@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { type Clock, SystemClock } from "./clock.js";
-import { deepFreeze, SecretRegistry } from "./secrets.js";
+import { deepFreeze, MIN_SECRET_LENGTH, SecretRegistry } from "./secrets.js";
 import {
   DeliveryError,
   type EmitMeta,
@@ -125,6 +125,10 @@ interface Running {
   polling: boolean;
   pollTimer?: unknown;
   inflight?: Promise<void>;
+  /** Requests a receiving source is still handling. A stop waits for them. */
+  active: Set<Promise<unknown>>;
+  /** Set once the stop began: resolves when the current look and requests ended and the stop functions ran. */
+  drained?: Promise<void>;
 }
 
 interface MutableStatus {
@@ -169,6 +173,12 @@ export class TelltaleHost {
   readonly #subscribers = new Map<string, Set<Subscriber>>();
   readonly #running = new Map<string, Running>();
   readonly #starting = new Map<string, Promise<void>>();
+  /** The run each pending start builds, so a stop can abort a start that waits on `api.signal`. */
+  readonly #startingRuns = new Map<string, Running>();
+  /** Runs whose stop began but has not finished draining, by source. */
+  readonly #draining = new Map<string, Set<Running>>();
+  /** close() calls in progress: no request is accepted meanwhile. */
+  #closing = 0;
   readonly #status = new Map<string, MutableStatus>();
 
   constructor(options: TelltaleHostOptions = {}) {
@@ -202,10 +212,16 @@ export class TelltaleHost {
    * option, a `does` line) comes back redacted.
    */
   plan(typeName: string, options: Record<string, unknown> = {}): SourcePlan {
-    const { type, plan } = this.#plan(typeName, options);
-    // This request's secrets are not the host's yet (nothing was added), so they are redacted from this answer only.
-    const secrets = this.secrets.with([...secretValues(type.options, options), ...secretValues(type.options, plan.options)]);
-    return secrets.deep({ ...plan, options: mask(type.options, plan.options) });
+    // This request's secrets are not the host's yet (nothing was added), so they are
+    // redacted from this answer only: from the plan, and from any error checking it throws.
+    let secrets = this.#requestSecrets(typeName, options);
+    try {
+      const { type, plan } = this.#plan(typeName, options);
+      secrets = secrets.with(secretValues(type.options, plan.options));
+      return secrets.deep({ ...plan, options: mask(type.options, plan.options) });
+    } catch (error) {
+      throw redactError(error, secrets);
+    }
   }
 
   /** Register a source. It does not start until something subscribes. */
@@ -216,7 +232,13 @@ export class TelltaleHost {
     if (this.#sources.has(input.id)) throw new Error(`a source with id "${input.id}" exists already`);
     const trust = input.trust ?? "untrusted";
     if (trust !== "owner" && trust !== "untrusted") throw new Error(`trust must be "owner" or "untrusted"`);
-    const { type, plan } = this.#plan(input.type, input.options ?? {});
+    let checked: { type: SourceType<any>; plan: SourcePlan };
+    try {
+      checked = this.#plan(input.type, input.options ?? {});
+    } catch (error) {
+      throw redactError(error, this.#requestSecrets(input.type, input.options ?? {}));
+    }
+    const { type, plan } = checked;
     const secretKeys = Object.keys(type.options).filter((k) => type.options[k]?.secret === true);
     for (const key of secretKeys) {
       const value = plan.options[key];
@@ -268,7 +290,8 @@ export class TelltaleHost {
       await this.#ensure(id);
     } catch (error) {
       set.delete(entry);
-      throw error;
+      // A start's error may quote a secret it was given.
+      throw redactError(error, this.secrets);
     }
     // close() or remove() ran while the source was starting: this subscription is already over.
     if (!this.#subscribers.get(id)?.has(entry)) throw new Error(`source "${id}" was stopped while it was starting`);
@@ -290,6 +313,7 @@ export class TelltaleHost {
    */
   async receive(id: string, request: ReceivedRequest): Promise<ReceiveResult> {
     if (!this.#sources.has(id)) return { accepted: false, status: 404, reason: "unknown_source", retryable: false };
+    if (this.#closing > 0) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
     const running = this.#running.get(id);
     if (!running?.receive) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
     return running.receive(request);
@@ -331,13 +355,30 @@ export class TelltaleHost {
   }
 
   /**
-   * Stop every source, including one still starting: a start that finishes
-   * after this never runs. Registrations stay.
+   * Stop every source, including one still starting (its `api.signal` is
+   * aborted, and a start that finishes afterwards never runs) and one already
+   * stopping. Resolves once every source drained: current looks and requests
+   * finished and stop functions ran. No request is accepted meanwhile.
+   * Registrations stay.
    */
   async close(): Promise<void> {
-    this.#subscribers.clear();
-    const ids = new Set([...this.#running.keys(), ...this.#starting.keys()]);
-    await Promise.all([...ids].map((id) => this.#stop(id)));
+    this.#closing++;
+    try {
+      this.#subscribers.clear();
+      const ids = new Set([...this.#running.keys(), ...this.#starting.keys(), ...this.#draining.keys()]);
+      await Promise.all([...ids].map((id) => this.#stop(id)));
+    } finally {
+      this.#closing--;
+    }
+  }
+
+  /** A registry with the host's secrets and the secret options of one request that was not added (yet). */
+  #requestSecrets(typeName: string, options: unknown): SecretRegistry {
+    const spec = this.#types.get(typeName)?.options;
+    if (!spec || !options || typeof options !== "object") return this.secrets;
+    return this.secrets.with(
+      secretValues(spec, options as Record<string, unknown>).filter((v) => v.length >= MIN_SECRET_LENGTH),
+    );
   }
 
   #plan(typeName: string, raw: Record<string, unknown>): { type: SourceType<any>; plan: SourcePlan } {
@@ -362,22 +403,27 @@ export class TelltaleHost {
   async #launch(id: string): Promise<void> {
     const reg = this.#sources.get(id)!;
     const status = this.#status.get(id)!;
-    const run: Running = { abort: new AbortController(), stops: [], polling: false };
+    const run: Running = { abort: new AbortController(), stops: [], polling: false, active: new Set() };
     const api = this.#api(reg, run, status);
     status.starting = true;
+    this.#startingRuns.set(id, run);
     try {
       await reg.type.start(api);
     } catch (error) {
-      await this.#teardown(run, true);
+      await this.#beginStop(id, run);
       status.starting = false;
+      // Aborted by a stop while it started: not a failure of the source.
+      if (run.abort.signal.aborted && !this.#wanted(id)) throw new Error(`source "${id}" was stopped while it was starting`);
       status.error = describeFailure(error, this.secrets);
       this.#log(reg.id).warn("source could not start", { error: status.error });
       throw error;
+    } finally {
+      this.#startingRuns.delete(id);
     }
     status.starting = false;
     // Unsubscribed, removed or closed while it was starting: it never runs.
-    if (!this.#wanted(id)) {
-      await this.#teardown(run, true);
+    if (!this.#wanted(id) || run.abort.signal.aborted) {
+      await this.#beginStop(id, run);
       this.#log(reg.id).info("source stopped before it ran");
       throw new Error(`source "${id}" was stopped while it was starting`);
     }
@@ -398,35 +444,52 @@ export class TelltaleHost {
   async #stop(id: string): Promise<void> {
     const inside = this.#inside(id);
     const pending = this.#starting.get(id);
-    // A start that is pending tears itself down once it sees nobody wants it.
-    if (pending && !inside) await pending.catch(() => {});
+    if (pending) {
+      // Nobody wants it: abort the start itself, so one waiting on api.signal ends now.
+      if (!this.#wanted(id)) this.#startingRuns.get(id)?.abort.abort();
+      if (!inside) await pending.catch(() => {});
+    }
     const run = this.#running.get(id);
-    if (!run) return;
-    // Still wanted by someone who subscribed while we were getting here.
-    if (this.#wanted(id)) return;
-    this.#running.delete(id);
-    // Called from a subscriber of this source: begin the stop now, finish draining after the delivery returns.
-    await this.#teardown(run, !inside);
-    const status = this.#status.get(id);
-    if (status) Object.assign(status, { failures: 0, failingSince: undefined, error: undefined });
-    this.#log(id).info("source stopped");
+    // Unless still wanted by someone who subscribed while we were getting here.
+    if (run && !this.#wanted(id)) {
+      this.#running.delete(id);
+      void this.#beginStop(id, run);
+      const status = this.#status.get(id);
+      if (status) Object.assign(status, { failures: 0, failingSince: undefined, error: undefined });
+      this.#log(id).info("source stopped");
+    }
+    // Called from a subscriber of this source: the stop has begun, and it finishes
+    // draining after that delivery returns. Anyone else waits for every drain.
+    if (!inside) await this.#drained(id);
   }
 
-  /** Abort, cancel the next look, then (draining, or once the current look ends) run the source's stop functions. */
-  async #teardown(run: Running, drain: boolean): Promise<void> {
+  /**
+   * Begin a stop (abort, cancel the next look) and start draining: wait for the
+   * current look and every request still being handled, then run the stop
+   * functions. The run stays in `#draining` until that is done.
+   */
+  #beginStop(id: string, run: Running): Promise<void> {
+    if (run.drained) return run.drained;
     run.abort.abort();
     if (run.pollTimer !== undefined) this.clock.clearTimer(run.pollTimer);
     run.pollTimer = undefined;
-    const finish = async () => {
+    let set = this.#draining.get(id);
+    if (!set) this.#draining.set(id, (set = new Set()));
+    const draining = set;
+    draining.add(run);
+    run.drained = (async () => {
+      await (run.inflight ?? Promise.resolve()).catch(() => {});
+      await Promise.allSettled([...run.active]);
       for (const fn of run.stops.splice(0).reverse()) await Promise.resolve().then(fn).catch(() => {});
-    };
-    const current = run.inflight ?? Promise.resolve();
-    if (drain) {
-      await current.catch(() => {});
-      await finish();
-    } else {
-      void current.catch(() => {}).then(finish);
-    }
+    })().finally(() => {
+      draining.delete(run);
+      if (draining.size === 0 && this.#draining.get(id) === draining) this.#draining.delete(id);
+    });
+    return run.drained;
+  }
+
+  async #drained(id: string): Promise<void> {
+    await Promise.all([...(this.#draining.get(id) ?? [])].map((r) => r.drained));
   }
 
   #log(id: string): Logger {
@@ -552,7 +615,9 @@ export class TelltaleHost {
           run.pollTimer = undefined;
           if (signal.aborted) return;
           status.lastLookAt = clock.now();
-          run.inflight = (async () => {
+          // Assigned before the look starts (a microtask later), so a stop the look
+          // itself triggers already sees it as the work to drain.
+          run.inflight = Promise.resolve().then(async () => {
             try {
               const staged = new Map<string, { value: unknown }>();
               await looking.run({ run, staged }, () => look(signal));
@@ -569,7 +634,7 @@ export class TelltaleHost {
               status.failingSince ??= clock.now();
               status.error = describeFailure(error, secrets);
             }
-          })();
+          });
           void run.inflight.then(() => {
             run.inflight = undefined;
             if (signal.aborted) return;
@@ -611,7 +676,14 @@ export class TelltaleHost {
       onReceive(handler) {
         run.receive = async (request) => {
           if (run.abort.signal.aborted) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
-          return handler(request);
+          // Tracked, so a stop waits for this request to finish.
+          const handling = handler(request);
+          run.active.add(handling);
+          try {
+            return await handling;
+          } finally {
+            run.active.delete(handling);
+          }
         };
       },
 
@@ -620,6 +692,15 @@ export class TelltaleHost {
       },
     };
   }
+}
+
+/** An error safe to hand back through a public method: the same message with every secret redacted, nothing else attached. */
+function redactError(error: unknown, secrets: SecretRegistry): Error {
+  const message = secrets.text(error instanceof Error ? error.message : String(error));
+  if (error instanceof SourceError) return new SourceError(message);
+  const clean = new Error(message);
+  if (error instanceof Error) clean.name = error.name;
+  return clean;
 }
 
 /** Status text for a failure: a source-authored message, or nothing that could quote outside content. */
