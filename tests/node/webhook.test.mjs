@@ -622,13 +622,14 @@ test("a __proto__ key in a signed body stays data: one subscriber cannot change 
 
 test("plan() and list() redact a copy of a secret wherever it appears, before and after add", async () => {
   const { host } = newHost({ start: START });
-  // The secret also used as a header name: a copy outside the option marked secret.
-  const options = { scheme: "signed-body", secret: SECRET, headers: { delivery: SECRET } };
+  // Hex, so it is also a valid header name: a copy of it outside the option marked secret.
+  const secret = randomBytes(20).toString("hex");
+  const options = { scheme: "signed-body", secret, headers: { delivery: secret } };
   const plan = host.plan("webhook", options);
   assert.equal(plan.options.secret, "[secret]");
   assert.ok(JSON.stringify(plan).includes("[redacted]"), "the check reached the copy");
-  assert.ok(!JSON.stringify(plan).includes(SECRET), "a copy of the secret leaked from plan()");
+  assert.ok(!JSON.stringify(plan).includes(secret), "a copy of the secret leaked from plan()");
   assert.equal(host.secrets.size, 0, "planning registers nothing with the host");
   host.add({ id: "gh", type: "webhook", options });
-  assert.ok(!JSON.stringify(host.list()).includes(SECRET), "a copy of the secret leaked from list()");
+  assert.ok(!JSON.stringify(host.list()).includes(secret), "a copy of the secret leaked from list()");
 });
