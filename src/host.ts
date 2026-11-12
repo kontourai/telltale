@@ -107,6 +107,8 @@ interface Registration {
   trust: Trust;
   bindings: Record<string, unknown>;
   statePrefix: string;
+  /** Objects a source keeps across starts (`api.keep`). They go with the registration. */
+  kept: Map<string, unknown>;
 }
 
 interface Running {
@@ -216,6 +218,7 @@ export class TelltaleHost {
       trust,
       bindings: (input.bindings ?? {}) as Record<string, unknown>,
       statePrefix: `${input.id}:${fingerprint}:`,
+      kept: new Map(),
     });
     this.#status.set(input.id, { failures: 0, emitted: 0, refused: 0, starting: false });
     return this.info(input.id)!;
@@ -525,6 +528,11 @@ export class TelltaleHost {
         if (before && JSON.stringify(before.value) === JSON.stringify(value)) return undefined;
         await state.set(k, { value });
         return before ? { previous: before.value } : undefined;
+      },
+
+      keep<T>(name: string, create: () => T): T {
+        if (!reg.kept.has(name)) reg.kept.set(name, create());
+        return reg.kept.get(name) as T;
       },
 
       secret(value: string | undefined): void {

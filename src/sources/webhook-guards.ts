@@ -51,14 +51,29 @@ export interface WebhookCredentials {
 }
 
 /**
- * Remembers which signed requests were already accepted. `claim` is called
- * only after a valid signature, so an unauthenticated caller can never burn
- * or lock a key. It must be atomic per key. Throw when it cannot decide (a
- * corrupt or full ledger): the request is refused `policy_unavailable`, so
- * replay protection is never silently removed.
+ * Remembers which authenticated requests were already delivered, as a small
+ * state machine per key: `reserve` takes a free key (reserved), `commit`
+ * marks it delivered after every subscriber took the event, and `release`
+ * frees a reservation whose delivery failed so the same request can be sent
+ * again. A reserved or delivered key refuses another `reserve`, so two
+ * concurrent copies of one request are never both delivered.
+ *
+ * `reserve` is called only after the request authenticated, so an
+ * unauthenticated caller can never burn or lock a key. It must be atomic per
+ * key. Throw when it cannot decide (a corrupt or full ledger): the request is
+ * refused `policy_unavailable`, so replay protection is never silently
+ * removed.
+ *
+ * `expiresAt` is the first instant at which the request the key guards is no
+ * longer accepted (stale, or past retention). Keep the key while
+ * `now < expiresAt`; forget it only when `now >= expiresAt`. A reservation
+ * that is never committed or released (the process stopped mid-delivery) may
+ * be held until `expiresAt`.
  */
 export interface ReplayLedger {
-  claim(key: string, expiresAt: number, now: number): MaybePromise<"claimed" | "replayed">;
+  reserve(key: string, expiresAt: number, now: number): MaybePromise<"reserved" | "replayed">;
+  commit(key: string, now: number): MaybePromise<void>;
+  release(key: string, now: number): MaybePromise<void>;
 }
 
 export class ReplayLedgerFullError extends Error {
@@ -70,28 +85,43 @@ export class ReplayLedgerFullError extends Error {
 
 /**
  * In-memory replay ledger. At capacity it first drops expired keys; if every
- * key is still live it refuses the claim instead of evicting one, because
- * evicting a live key would reopen the replay window it exists to close.
+ * key is still live it refuses the reservation instead of evicting one,
+ * because evicting a live key would reopen the replay window it exists to
+ * close.
  */
 export class InMemoryReplayLedger implements ReplayLedger {
-  readonly #keys = new Map<string, number>();
+  readonly #keys = new Map<string, { expiresAt: number; state: "reserved" | "delivered" }>();
 
   constructor(readonly maxEntries = 10_000) {}
 
-  claim(key: string, expiresAt: number, now: number): "claimed" | "replayed" {
+  reserve(key: string, expiresAt: number, now: number): "reserved" | "replayed" {
     const existing = this.#keys.get(key);
-    if (existing !== undefined && existing > now) return "replayed";
+    if (existing !== undefined && now < existing.expiresAt) return "replayed";
     if (existing !== undefined) this.#keys.delete(key);
     if (this.#keys.size >= this.maxEntries) {
-      for (const [k, at] of this.#keys) if (at <= now) this.#keys.delete(k);
+      for (const [k, entry] of this.#keys) if (now >= entry.expiresAt) this.#keys.delete(k);
       if (this.#keys.size >= this.maxEntries) throw new ReplayLedgerFullError(this.maxEntries);
     }
-    this.#keys.set(key, expiresAt);
-    return "claimed";
+    this.#keys.set(key, { expiresAt, state: "reserved" });
+    return "reserved";
+  }
+
+  commit(key: string): void {
+    const entry = this.#keys.get(key);
+    if (entry) entry.state = "delivered";
+  }
+
+  release(key: string): void {
+    if (this.#keys.get(key)?.state === "reserved") this.#keys.delete(key);
   }
 
   get size(): number {
     return this.#keys.size;
+  }
+
+  /** A key's state, for tests and debugging. */
+  state(key: string): "reserved" | "delivered" | undefined {
+    return this.#keys.get(key)?.state;
   }
 }
 
@@ -171,22 +201,40 @@ export class AttemptLimiter {
   }
 }
 
-/** A budget of refused attempts. Bind one instance to several webhook sources to share it. */
+/**
+ * A budget of refused attempts, with admission. Bind one instance to several
+ * webhook sources to share it.
+ *
+ * A webhook asks `admit` before any work on a request that has not
+ * authenticated yet, and calls `release` exactly once when that request is
+ * done, whatever the outcome. `fail` counts one refusal. Requests still in
+ * flight count against the budget, so a burst of concurrent requests cannot
+ * all start a credential lookup before the first of them is refused.
+ *
+ * A consumer that refuses a request Telltale accepted (a malformed payload, a
+ * forbidden start) calls `fail` too, so its refusals share the budget.
+ */
 export interface UnauthenticatedBudget {
-  tripped(now: number): boolean;
+  /** Room for one more request? `true` reserves it until `release`. `false`: refuse it without a lookup. */
+  admit(now: number): boolean;
+  /** Give back a reservation made by `admit`. */
+  release(): void;
+  /** Count one refused attempt. */
   fail(now: number): void;
 }
 
 /**
  * A global budget of refused attempts, independent of the presented
  * credential id: a rotating id gets a fresh per-credential bucket every
- * request, never a fresh budget. Once it trips, every request is refused for
- * the rest of the window without a credential lookup, including a correctly
- * signed one. That availability trade is deliberate: verifying past the trip
- * would bring back the per-request lookup the budget exists to stop.
+ * request, never a fresh budget. Once refusals plus requests in flight reach
+ * the limit, every request is refused for the rest of the window without a
+ * credential lookup, including a correctly signed one. That availability
+ * trade is deliberate: verifying past the trip would bring back the
+ * per-request lookup the budget exists to stop.
  */
 export class FailureBudget implements UnauthenticatedBudget {
   #count = 0;
+  #inflight = 0;
   #windowStart = Number.NEGATIVE_INFINITY;
 
   constructor(
@@ -194,8 +242,29 @@ export class FailureBudget implements UnauthenticatedBudget {
     readonly windowMs: number,
   ) {}
 
+  /** Refusals counted in the current window. */
+  failures(now: number): number {
+    return now < this.#windowStart + this.windowMs ? this.#count : 0;
+  }
+
+  /** Requests admitted and not yet released. */
+  get inflight(): number {
+    return this.#inflight;
+  }
+
+  /** Whether the refusals of this window alone have spent the budget. */
   tripped(now: number): boolean {
-    return this.#count >= this.maxFailures && now < this.#windowStart + this.windowMs;
+    return this.failures(now) >= this.maxFailures;
+  }
+
+  admit(now: number): boolean {
+    if (this.failures(now) + this.#inflight >= this.maxFailures) return false;
+    this.#inflight += 1;
+    return true;
+  }
+
+  release(): void {
+    if (this.#inflight > 0) this.#inflight -= 1;
   }
 
   fail(now: number): void {

@@ -142,6 +142,14 @@ export interface SourceApi<Bindings = Record<string, unknown>> {
     set(key: string, value: unknown): Promise<void>;
     delete(key: string): Promise<void>;
   };
+  /**
+   * An object that lives as long as the source's registration, not as long as
+   * this start: the same object comes back after the last subscriber left and
+   * a new one arrived. For guards whose memory must outlast a subscription (a
+   * replay ledger, a rate limit). `create` runs on the first call for `name`;
+   * `remove()` forgets it.
+   */
+  keep<T>(name: string, create: () => T): T;
   /** Keep this value out of events, refusals, status lines and logs from now on. */
   secret(value: string | undefined): void;
   /**

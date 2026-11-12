@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { FailureBudget, InMemoryReplayLedger, InMemoryWebhookAudit } from "../../dist/index.js";
+import { FailureBudget, InMemoryReplayLedger, InMemoryWebhookAudit, settle } from "../../dist/index.js";
 import { newHost, collect } from "./helpers.mjs";
 
 // Generated per run: 24 random bytes are 32 base64url characters, the floor.
@@ -205,9 +205,11 @@ test("an unreadable credential store or replay ledger fails closed", async () =>
   const broken = await setup({
     bindings: {
       replay: {
-        claim() {
+        reserve() {
           throw new Error("ledger corrupt");
         },
+        commit() {},
+        release() {},
       },
     },
   });
@@ -314,7 +316,7 @@ test("trust cannot be raised by payload content or headers", async () => {
   assert.equal(events[0].hops, 0);
 });
 
-test("signed-body (GitHub style): verifies X-Hub-Signature-256 over the body and dedupes on the delivery id", async () => {
+test("signed-body (GitHub style): verifies X-Hub-Signature-256 over the body and refuses the same signed body again", async () => {
   const ctx = newHost({ start: START });
   ctx.host.add({ id: "gh", type: "webhook", options: { scheme: "signed-body", secret: SECRET } });
   const { events } = await collect(ctx.host, "gh");
@@ -328,7 +330,7 @@ test("signed-body (GitHub style): verifies X-Hub-Signature-256 over the body and
   assert.equal(ok.status, 202);
   assert.equal(events[0].deliveryId, "72d3162e-cc78-11e3-81ab-4c9367dc0958");
   assert.equal(events[0].payload.headers["x-github-event"], "workflow_run");
-  assert.match(events[0].dedupKey, /^delivery:[0-9a-f]{64}$/);
+  assert.match(events[0].dedupKey, /^request:[0-9a-f]{64}$/);
   assert.equal((await ctx.host.receive("gh", req("72d3162e-cc78-11e3-81ab-4c9367dc0958"))).reason, "replay");
   assert.equal((await ctx.host.receive("gh", req("other-delivery", `sha256=${"a".repeat(64)}`))).reason, "invalid_signature");
   assert.equal((await ctx.host.receive("gh", { headers: { "X-Hub-Signature-256": sig }, body })).reason, "malformed_request");
@@ -364,4 +366,227 @@ test("a subscriber failure answers 503 delivery_failed", async () => {
   });
   const result = await host.receive("inbound", request(BODY));
   assert.deepEqual(result, { accepted: false, status: 503, reason: "delivery_failed", retryable: true });
+});
+
+// ---- Fix round 1 -------------------------------------------------------------
+
+const ghSign = (body, secret = SECRET) => `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+
+async function githubHook(options = {}, bindings = {}) {
+  const ctx = newHost({ start: START });
+  ctx.host.add({ id: "gh", type: "webhook", options: { scheme: "signed-body", secret: SECRET, ...options }, bindings });
+  return { ...ctx, ...(await collect(ctx.host, "gh")) };
+}
+
+test("signed-body: replay identity comes from the signed bytes, not the unsigned delivery header", async () => {
+  const { host, events } = await githubHook();
+  const body = JSON.stringify({ action: "completed", workflow_run: { id: 7 } });
+  const req = (delivery) => ({ headers: { "x-hub-signature-256": ghSign(body), "x-github-delivery": delivery }, body });
+  const first = await host.receive("gh", req("captured-delivery"));
+  assert.equal(first.status, 202);
+  // A captured body and signature with a new delivery id is the same signed request.
+  const replayed = await host.receive("gh", req("attacker-replacement"));
+  assert.deepEqual([replayed.status, replayed.reason], [403, "replay"]);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].deliveryId, "captured-delivery", "the delivery id is still carried, as metadata");
+});
+
+test("signed-body: GitHub's redelivery (same body, same GUID) is refused once delivered, and delivered when the first try failed", async () => {
+  const { host } = await githubHook();
+  let fail = true;
+  const delivered = [];
+  await host.subscribe("gh", (e) => {
+    if (fail) throw new Error("consumer store unavailable");
+    delivered.push(e);
+  });
+  const body = JSON.stringify({ action: "completed", workflow_run: { id: 8 } });
+  const req = { headers: { "x-hub-signature-256": ghSign(body), "x-github-delivery": "guid-1" }, body };
+  const first = await host.receive("gh", req);
+  assert.deepEqual([first.status, first.reason, first.retryable], [503, "delivery_failed", true]);
+  fail = false;
+  const redelivery = await host.receive("gh", req);
+  assert.equal(redelivery.status, 202, "a failed delivery left the key free for GitHub's redelivery");
+  assert.equal(delivered.length, 1);
+  const again = await host.receive("gh", req);
+  assert.equal(again.reason, "replay", "after a delivered copy, the redelivery is a replay");
+  assert.equal(delivered.length, 1);
+});
+
+test("bearer with a delivery header folds duplicate delivery ids, and says it has no replay protection", async () => {
+  const ctx = newHost({ start: START });
+  ctx.host.add({ id: "b", type: "webhook", options: { scheme: "bearer", secret: SECRET, headers: { delivery: "x-delivery" } } });
+  const { events } = await collect(ctx.host, "b");
+  const req = (delivery) => ({ headers: { authorization: `Bearer ${SECRET}`, "x-delivery": delivery }, body: "{}" });
+  assert.equal((await ctx.host.receive("b", req("d-1"))).status, 202);
+  assert.equal((await ctx.host.receive("b", req("d-1"))).reason, "replay");
+  // Nothing is signed: whoever captured a request holds the credential and can send anything.
+  assert.equal((await ctx.host.receive("b", req("d-2"))).status, 202);
+  assert.equal(events.length, 2);
+  assert.match(events[0].dedupKey, /^delivery:[0-9a-f]{64}$/);
+  const plan = ctx.host.plan("webhook", { scheme: "bearer", secret: SECRET, headers: { delivery: "x-delivery" } });
+  assert.ok(plan.does.some((d) => /NO replay protection/.test(d)));
+});
+
+test("an unsubscribe and a new subscriber do not reset the replay ledger, the limiter or the budget", async () => {
+  const { host, subscription } = await setup({ options: { perCredentialPerMinute: 2, unauthenticatedPerMinute: 1000 } });
+  const n = nonce();
+  assert.equal((await host.receive("inbound", request(BODY, { n }))).status, 202);
+  await subscription.unsubscribe();
+  assert.equal(host.status("inbound").state, "stopped");
+  const sink = await collect(host, "inbound");
+  const replayed = await host.receive("inbound", request(BODY, { n }));
+  assert.equal(replayed.reason, "replay", "the identical request is still a replay after resubscribing");
+  assert.equal(sink.events.length, 0);
+  // Two attempts already counted for this credential this minute.
+  assert.equal((await host.receive("inbound", request(BODY))).reason, "rate_limited");
+});
+
+test("a credential rotated while the body is read: the request is verified with the secret that was looked up, and the new one never leaks", async () => {
+  const token = { id: "ci-deploy", secret: SECRET };
+  const ctx = newHost({ start: START });
+  ctx.host.add({ id: "inbound", type: "webhook", bindings: { credentials: { lookup: () => ({ enabled: true, credential: token }) } } });
+  const { events } = await collect(ctx.host, "inbound");
+  const rotated = randomBytes(24).toString("base64url");
+  const body = JSON.stringify({ message: `new secret ${rotated}` });
+  const n = nonce();
+  let release;
+  const pending = ctx.host.receive("inbound", {
+    ...request(body, { n, signature: sign(body, n, ts(), rotated) }),
+    body: () => new Promise((resolve) => (release = resolve)),
+  });
+  await settle();
+  token.secret = rotated;
+  release(body);
+  const result = await pending;
+  assert.equal(result.reason, "invalid_signature");
+  assert.equal(events.length, 0);
+  assert.ok(!JSON.stringify(ctx.log.lines).includes(rotated));
+});
+
+test("a credential lookup failure logs a fixed code, never the store's exception text", async () => {
+  const marker = "do-not-log-this-store-detail-0123456789";
+  const ctx = newHost({ start: START });
+  ctx.host.add({
+    id: "inbound",
+    type: "webhook",
+    bindings: {
+      credentials: {
+        lookup() {
+          throw new Error(`cannot read /etc/station/tokens: ${marker}`);
+        },
+      },
+    },
+  });
+  await collect(ctx.host, "inbound");
+  const result = await ctx.host.receive("inbound", request(BODY));
+  assert.equal(result.reason, "policy_unavailable");
+  assert.ok(ctx.log.lines.some((l) => l.includes("credential_lookup_failed")), "the failure is logged");
+  assert.ok(ctx.log.lines.every((l) => !l.includes(marker)), "but not its text");
+});
+
+test("a retryable delivery failure leaves the request retryable; a concurrent copy is still refused", async () => {
+  const { host } = await setup();
+  let mode = "fail";
+  let unblock;
+  const delivered = [];
+  await host.subscribe("inbound", async (e) => {
+    if (mode === "fail") throw new Error("storage unavailable");
+    if (mode === "block") await new Promise((resolve) => (unblock = resolve));
+    delivered.push(e);
+  });
+  const n = nonce();
+  const req = () => request(BODY, { n });
+  const first = await host.receive("inbound", req());
+  assert.deepEqual([first.status, first.reason, first.retryable], [503, "delivery_failed", true]);
+
+  mode = "block";
+  const retry = host.receive("inbound", req());
+  await settle();
+  const concurrent = await host.receive("inbound", req());
+  assert.equal(concurrent.reason, "replay", "a copy arriving while one is being delivered is refused");
+  unblock();
+  const retried = await retry;
+  assert.equal(retried.status, 202, "the identical retry was delivered");
+  assert.equal(delivered.length, 1);
+
+  mode = "ok";
+  assert.equal((await host.receive("inbound", req())).reason, "replay", "once delivered, it is a replay");
+  assert.equal(delivered.length, 1);
+});
+
+test("concurrent requests cannot overshoot the global budget: admission counts requests still in flight", async () => {
+  const ctx = newHost({ start: START });
+  let lookups = 0;
+  ctx.host.add({
+    id: "inbound",
+    type: "webhook",
+    options: { unauthenticatedPerMinute: 3 },
+    bindings: {
+      credentials: {
+        async lookup() {
+          lookups++;
+          await new Promise((r) => setImmediate(r));
+          return { enabled: true };
+        },
+      },
+    },
+  });
+  await collect(ctx.host, "inbound");
+  const results = await Promise.all(
+    Array.from({ length: 100 }, (_, i) => ctx.host.receive("inbound", request(BODY, { token: `rotating-${i}` }))),
+  );
+  assert.ok(lookups <= 3, `${lookups} lookups for a budget of 3`);
+  assert.ok(results.filter((r) => r.status === 429).length >= 97);
+});
+
+test("an authenticated request gives its admission back: the budget only charges refusals", async () => {
+  const budget = new FailureBudget(2, 60_000);
+  const { host } = await setup({ bindings: { budget } });
+  for (let i = 0; i < 5; i++) assert.equal((await host.receive("inbound", request(BODY))).status, 202);
+  assert.equal(budget.inflight, 0);
+  assert.equal(budget.failures(START), 0);
+});
+
+test("replay and freshness share one boundary: at exactly signedAt + window the request is fresh and its key is live", async () => {
+  const { host, clock, events } = await setup();
+  const n = nonce();
+  assert.equal((await host.receive("inbound", request(BODY, { n }))).status, 202);
+  await clock.set(START + 300_000);
+  const atBoundary = await host.receive("inbound", request(BODY, { n }));
+  assert.equal(atBoundary.reason, "replay", "fresh (inclusive) and still remembered");
+  await clock.set(START + 300_001);
+  assert.equal((await host.receive("inbound", request(BODY, { n }))).reason, "stale_timestamp");
+  assert.equal(events.length, 1);
+  // The boundary is inclusive for a first delivery too.
+  const fresh = await setup();
+  await fresh.clock.set(START + 300_000);
+  assert.equal((await fresh.host.receive("inbound", request(BODY))).status, 202);
+});
+
+test("a body that arrives after the window closed is stale", async () => {
+  const { host, clock, events } = await setup();
+  let release;
+  const pending = host.receive("inbound", request(BODY, { bodyReader: () => new Promise((r) => (release = r)) }));
+  await settle();
+  await clock.advance(300_001);
+  release(BODY);
+  assert.equal((await pending).reason, "stale_timestamp");
+  assert.equal(events.length, 0);
+});
+
+test("a security header given twice, in two spellings, is refused whichever comes first", async () => {
+  for (const order of ["valid-last", "valid-first"]) {
+    const { host, events } = await setup();
+    const n = nonce();
+    const good = sign(BODY, n);
+    const bad = `sha256=${"0".repeat(64)}`;
+    const base = request(BODY, { n });
+    delete base.headers["x-telltale-signature"];
+    base.headers = order === "valid-last"
+      ? { ...base.headers, "x-telltale-signature": bad, "X-Telltale-Signature": good }
+      : { ...base.headers, "X-Telltale-Signature": good, "x-telltale-signature": bad };
+    const result = await host.receive("inbound", base);
+    assert.equal(result.reason, "invalid_signature", order);
+    assert.equal(events.length, 0);
+  }
 });
