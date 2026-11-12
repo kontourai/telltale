@@ -667,9 +667,10 @@ test("a delivery slower than the key's lifetime keeps its reservation: an identi
   const a = c.send();
   await settle();
   await c.clock.advance(3_600_001);
-  const b = await c.send();
-  assert.equal(b.reason, "replay", "the reservation was extended while A was delivering");
-  assert.equal(c.attempts(), 1);
+  const b = c.send();
+  await settle();
+  assert.equal(c.attempts(), 1, "an identical request was delivered while A still was");
+  assert.equal((await b).reason, "replay", "the reservation was extended while A was delivering");
   c.gates[0]();
   assert.equal((await a).status, 503);
   const retry = c.send();
@@ -786,7 +787,11 @@ test("a stop does not wait on a body that never arrives, and gives its admission
   const stalled = host.receive("inbound", request(BODY, { bodyReader: () => new Promise(() => {}) }));
   await settle();
   assert.equal(budget.inflight, 1);
-  await subscription.unsubscribe();
+  let stopped = false;
+  const stopping = subscription.unsubscribe().then(() => (stopped = true));
+  await settle();
+  assert.equal(stopped, true, "the stop waited on the body");
+  await stopping;
   assert.deepEqual([(await stalled).status, (await stalled).reason], [404, "not_listening"]);
   assert.equal(budget.inflight, 0, "the admission was returned");
   await collect(host, "inbound");

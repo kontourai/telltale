@@ -427,8 +427,12 @@ test("close() aborts a start that waits on api.signal, and waits for it", async 
   const starting = host.subscribe("s", () => {});
   starting.catch(() => {});
   await settle();
-  await host.close();
-  assert.equal(signal.aborted, true);
+  let closed = false;
+  const closing = host.close().then(() => (closed = true));
+  await settle();
+  assert.equal(signal.aborted, true, "the start's signal was aborted");
+  assert.equal(closed, true, "close() finished");
+  await closing;
   assert.equal(stops, 1);
   await assert.rejects(starting, /stopped while it was starting/);
   assert.equal(host.status("s").state, "stopped");
