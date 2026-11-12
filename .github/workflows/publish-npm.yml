@@ -53,6 +53,9 @@ jobs:
 
   publish:
     needs: verify
+    # A workflow_dispatch from a branch never publishes; the ref-type guard
+    # below enforces the same thing inside the job.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -62,6 +65,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
@@ -76,6 +80,16 @@ jobs:
       # The release guards run before the install, so no lifecycle script from
       # the repository runs (with id-token: write) until the ref is a tag on
       # main whose version matches package.json. They only read files.
+      # tests/node/publish-guards.test.mjs runs these guard scripts.
+      - name: Verify Ref Is A Tag
+        run: |
+          # A branch named like a version (refs/heads/v0.1.0) has the same
+          # GITHUB_REF_NAME as the tag, so the name checks alone cannot tell them apart.
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "${GITHUB_REF} is a ${GITHUB_REF_TYPE}, not a tag; refusing to publish" >&2
+            exit 1
+          fi
+
       - name: Verify Tag Matches Package Version
         run: |
           PACKAGE_VERSION=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
