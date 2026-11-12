@@ -3,9 +3,9 @@
 [![CI](https://github.com/kontourai/telltale/actions/workflows/ci.yml/badge.svg)](https://github.com/kontourai/telltale/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Status: 0.1 (first slice; not yet published to npm). The webhook, GitHub
-poll and folder sources are implemented and tested; the contract may still
-change before 1.0.
+Status: 0.1 (first slice; published to npm as `@kontourai/telltale`). The
+webhook, GitHub poll and folder sources are implemented and tested; the
+contract may still change before 1.0.
 
 **The Kontour suite's event actor.** Layer: event actor, the sibling of
 [Ephemeris](https://github.com/kontourai/ephemeris) (the time actor).

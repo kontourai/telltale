@@ -14,6 +14,10 @@
 - TypeScript/API changes: run `npm run typecheck` plus the focused test file that covers the touched code (`npm run build && node --test tests/node/<file>.test.mjs`).
 - Package or behavior changes: run `npm test`; it builds first, then runs deterministic `node --test` tests.
 - Generated output: do not edit `dist/` or other generated files by hand.
+- Releases use release-please with conventional commits; the version lives in
+  `.release-please-manifest.json` and `package.json`. Merging the release PR
+  tags the release and dispatches `publish-npm.yml`, which publishes through npm
+  trusted publishing. Do not bump versions, push tags or run `npm publish` by hand.
 
 ## Useful Commands
 

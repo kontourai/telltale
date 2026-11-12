@@ -1,8 +1,11 @@
 # Getting started
 
-Telltale will be published to npm as `@kontourai/telltale`. It is an ES module
-package for Node.js 22 or newer with no runtime dependencies. Until the first
-release, build it from this repository (`pnpm install && npm run build`).
+Telltale is published to npm as `@kontourai/telltale`. It is an ES module
+package for Node.js 22 or newer with no runtime dependencies.
+
+```sh
+npm install @kontourai/telltale
+```
 
 ## A host, a source, a subscriber
 

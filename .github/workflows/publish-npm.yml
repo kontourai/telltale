@@ -6,66 +6,77 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# Read-only everywhere. Only the publish job, behind its environment and its
-# release guards, can mint the OIDC token npm trusted publishing uses.
+# Serialize publish runs so a duplicate trigger (the release tag push and a
+# workflow_dispatch firing within seconds of each other) cannot race: the second run
+# waits for the first to finish, then the "Check Published Version" step sees the version
+# already on npm and skips — instead of E403'ing on a double `npm publish`.
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         node-version: ['22', '24']
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          persist-credentials: false
+          fetch-depth: 0
+
       # Reads the exact pnpm version from package.json's packageManager field.
       - name: Setup pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-      - uses: actions/setup-node@v6
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Setup Node
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
-      - run: pnpm install --frozen-lockfile
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm pack --dry-run
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Pack Dry Run
+        run: npm pack --dry-run
 
   publish:
-    needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
     runs-on: ubuntu-latest
-    # A protected environment the owner creates (required reviewers, tag-only
-    # deployment branches). npm's trusted publisher should name it too.
-    environment: npm-publish
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      # No `registry-url` here, unlike ephemeris: it writes an .npmrc token line
-      # that pins npm to the token path, so OIDC trusted publishing never runs.
-      - uses: actions/setup-node@v6
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      # No `registry-url`: it writes an .npmrc token line that pins npm to the
+      # token path, so OIDC trusted publishing would not be used.
+      - name: Setup Node
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
+          package-manager-cache: false
 
-      # The release guards run before anything from the repository does: no
-      # install, no lifecycle script, no build until the ref is a version tag
-      # on main whose version matches package.json. They only read files.
-      - name: Verify the ref is a version tag
-        run: |
-          if [ "${GITHUB_REF_TYPE}" != "tag" ] || ! printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "${GITHUB_REF} is not a version tag" >&2
-            exit 1
-          fi
-
-      - name: Verify tag matches package version
+      # The release guards run before the install, so no lifecycle script from
+      # the repository runs (with id-token: write) until the ref is a tag on
+      # main whose version matches package.json. They only read files.
+      - name: Verify Tag Matches Package Version
         run: |
           PACKAGE_VERSION=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
           if [ "v${PACKAGE_VERSION}" != "${GITHUB_REF_NAME}" ]; then
@@ -73,18 +84,19 @@ jobs:
             exit 1
           fi
 
-      - name: Verify tagged commit is on main
+      - name: Verify Tagged Commit Is On Main
         run: |
           # Full fetch: a --depth=1 fetch would make this clone shallow at main's tip,
           # so any tagged commit behind that tip would look unreachable.
           git fetch --no-tags origin main
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD; then
-            echo "Tagged commit ${GITHUB_SHA} is not reachable from origin/main" >&2
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "FETCH_HEAD"; then
+            echo "Tagged commit ${GITHUB_SHA} is not reachable from the fetched origin/main tip" >&2
             exit 1
           fi
 
-      - name: Require npm with trusted publishing (>= 11.5.1)
+      - name: Require npm With Trusted Publishing (>= 11.5.1)
         run: |
+          # shellcheck disable=SC2016 # ${...} is a JS template literal, not shell.
           node -e '
             const [a, b, c] = process.argv[1].split(".").map(Number);
             if (a < 11 || (a === 11 && (b < 5 || (b === 5 && c < 1)))) {
@@ -92,25 +104,22 @@ jobs:
               process.exit(1);
             }' "$(npm --version)"
 
-      # Publishing stays on the npm CLI: provenance and the registry binding are
-      # properties of the publisher, not the installer, and `npm publish` needs
-      # only the built package directory.
-      - name: Setup pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-      - run: pnpm install --frozen-lockfile
+      - name: Install
+        run: pnpm install --frozen-lockfile
 
-      - name: Skip if already published
+      - name: Check Published Version
         id: published
         run: |
-          NAME=$(node -p "require('./package.json').name")
-          VER=$(node -p "require('./package.json').version")
-          if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
+          PACKAGE_NAME=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).name")
+          PACKAGE_VERSION=$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
             echo "published=true" >> "${GITHUB_OUTPUT}"
-            echo "${NAME}@${VER} already published; skipping."
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} is already published; skipping npm publish."
           else
             echo "published=false" >> "${GITHUB_OUTPUT}"
           fi
 
+      # `prepack` builds dist/ before the tarball is assembled.
       - name: Publish
         if: steps.published.outputs.published != 'true'
         run: npm publish --access public --provenance
