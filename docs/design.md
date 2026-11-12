@@ -127,17 +127,19 @@ Stopping is split into beginning (abort, cancel the next look) and draining
 handling, then run the stop functions). A run stays tracked from the moment
 its stop began until it drained. `close()`, `remove()` and an unsubscribe
 resolve only once every drain of that source finished, including one a
-subscriber began earlier; `close()` refuses new requests while it runs. The
-one exception is a call made from inside a delivery of the same source: it
-begins the stop and returns, because the drain includes the delivery it is
-made from. A webhook's own waits on things outside Telltale (the credential
+subscriber began earlier (a repeated `unsubscribe()` joins it too); `close()`
+refuses new requests while it runs. The one exception is a call made from
+inside the source's own work (its start, a look, its request handler, a
+delivery, a stop function): it begins the stop and returns, because the drain
+includes the work it is made from. A webhook's own waits on things outside Telltale (the credential
 store, the body, the ledger) end when the source stops, so a stop never
 waits on a body that never arrives; subscribers are waited for, since a
 delivery in progress is work to finish, not to drop.
 
-Errors thrown by `plan()`, `add()` and `subscribe()` carry their message with
-every secret redacted, the request's own secret options included, and nothing
-else attached.
+Errors thrown by `plan()`, `add()` and `subscribe()` carry their message, name
+and stack with every secret redacted, the request's own secret options
+included, and nothing else attached. Every check `add()` makes is inside that
+boundary.
 
 State is namespaced by source id plus a fingerprint of the type and its
 non-secret options: re-adding the same configuration resumes its cursor; a
@@ -235,12 +237,24 @@ chose it):
    A ledger that throws, answers in another shape, or is full of live keys,
    refuses `policy_unavailable`.
 
+**One host never delivers two identical copies at once.** Besides the ledger,
+each registration keeps an in-process set of keys it is handling, checked and
+taken before the reservation and held until the delivery settled. A second
+identical request is refused `replay` while the first is with a subscriber,
+however the lease was lost: an `extend` that answered false, threw or never
+answered, a `reserve` answer that arrived after its expiry, or a step of the
+clock. Several hosts sharing one ledger get no such exclusion: they need a
+ledger that fences (keeps a lapsed holder's delivery from overlapping a newer
+one), which Telltale does not provide.
+
 **What a pluggable ledger must guarantee.** `reserve` checks and takes the key
 in one atomic step (a transaction, a compare-and-set, a unique insert); a read,
 an await and a write lets two concurrent copies both reserve and both be
 delivered. `extend`, `commit` and `release` compare
 the token and change the entry in the same atomic step. A holder that stopped
-(a crash) keeps its reservation until its last `expiresAt`.
+(a crash) keeps its reservation until its last `expiresAt`. Every ledger
+operation must settle: a stop waits for a pending `commit` or `release`, so
+bound them (a timeout in the adapter) rather than let one hang.
 8. Emit `received` `{ credentialId, body, headers }`. The body is parsed as
    JSON (strict UTF-8) or carried as `{ text }`. Only allow-listed headers are
    kept; credential-bearing headers cannot be added to that list.

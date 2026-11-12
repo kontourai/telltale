@@ -196,6 +196,10 @@ store, as the authorization service does today.
   of a request both reserve. `extend`, `commit` and `release` compare the
   owner token in that same step, so a holder whose reservation lapsed cannot
   touch a newer one.
+- **Every replay store call must settle.** A stop waits for a pending
+  `commit` or `release`; give the adapter a timeout. A store shared by several
+  Station processes would also need fencing, which Telltale does not provide;
+  within one process Telltale never delivers two identical copies at once.
 - **Bound the body read.** `readBoundedBody` should also stop after a
   deadline: a request holds room in the shared budget until it authenticates,
   so a sender that never finishes its body would otherwise hold it.

@@ -135,7 +135,11 @@ still owns the key, atomically with that check, and return whether they did.
 A reserved or delivered key refuses another `reserve`. `expiresAt` is the
 first instant the key is free again: keep it while `now < expiresAt`. Throw
 when you cannot decide (the request is refused `policy_unavailable`).
-`ReplayReservation` is the type `reserve` returns.
+Every operation must settle; bound them in your adapter, since a stop waits
+for a pending `commit` or `release`. `ReplayReservation` is the type `reserve`
+returns. Within one host a second identical request is refused `replay` while
+the first is being delivered, whatever the ledger says; hosts sharing a
+ledger need one that fences.
 
 `UnauthenticatedBudget`: `admit(now)` before any work on a request (false:
 refuse it, no lookup), `release()` once that request authenticated or ended,
