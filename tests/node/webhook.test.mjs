@@ -661,23 +661,24 @@ async function slowGithubHook(bindings = {}) {
   return { ...ctx, send, gates, outcomes, attempts: () => count };
 }
 
-test("a delivery slower than the key's lifetime keeps its reservation: an identical request is refused meanwhile", async () => {
-  const c = await slowGithubHook();
-  c.outcomes[0] = "fail";
-  const a = c.send();
+test("a delivery slower than the key's lifetime keeps its reservation: an identical request is refused meanwhile", async (t) => {
+  // Two hosts sharing one ledger: only the extended lease (not the in-process exclusion) keeps B out.
+  const { one, two, advance } = await twoHostsSharing(t, new InMemoryReplayLedger());
+  one.outcomes[0] = "fail";
+  const a = one.send();
   await settle();
-  await c.clock.advance(3_600_001);
-  const b = c.send();
+  await advance(3_600_001);
+  const b = two.send();
   await settle();
-  assert.equal(c.attempts(), 1, "an identical request was delivered while A still was");
+  assert.equal(two.attempts(), 0, "an identical request was delivered while A still was");
   assert.equal((await b).reason, "replay", "the reservation was extended while A was delivering");
-  c.gates[0]();
+  one.gates[0]();
   assert.equal((await a).status, 503);
-  const retry = c.send();
+  const retry = two.send();
   await settle();
-  c.gates[1]();
-  assert.equal((await retry).status, 202, "A's own release freed the key for a retry");
-  assert.equal(c.attempts(), 2, "A, then its retry; B was never delivered");
+  assert.equal(two.attempts(), 1, "A's own release freed the key for a retry");
+  two.gates[0]();
+  assert.equal((await retry).status, 202);
 });
 
 /** A ledger that cannot extend: the lease lapses under a slow delivery, so ownership must protect the newer holder. */
