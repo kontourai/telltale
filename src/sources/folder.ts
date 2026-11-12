@@ -1,5 +1,5 @@
-import { type Dirent, readdirSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { type Dir, lstatSync, opendirSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { SourceError, type SourceApi, type SourceType } from "../source-type.js";
 import { parseDuration } from "../util.js";
 
@@ -16,6 +16,20 @@ import { parseDuration } from "../util.js";
  * Events: `added` `{ file, size }` for a file not seen before, `changed`
  * `{ file, size }` for one whose content changed. `file` is relative to the
  * folder. Symbolic links are never followed.
+ *
+ * Where it reads is pinned: the folder's device and inode are taken when the
+ * source starts, and every folder entered is checked by `lstat` (not a link,
+ * the same device and inode before and after it is read) and by `realpath`
+ * (still inside the folder, at the path it was found by). A scan that sees
+ * any of that change fails instead of reporting. The residual race: a folder
+ * swapped for another and swapped back between those two checks is not
+ * seen; Node has no `openat`/`fdopendir` to read through a pinned handle.
+ *
+ * Every scan is bounded: files (`maxFiles`), folders (`maxDirectories`),
+ * depth (`maxDepth`) and directory entries read of any kind (`maxEntries`).
+ * Directories are streamed a batch at a time, and a scan stops at the next
+ * entry once the source stops. Over a bound, the scan fails; it never
+ * truncates.
  */
 
 /** Paths that change all the time without anyone having done anything worth reporting. */
@@ -24,6 +38,14 @@ const DEFAULT_IGNORE =
 const MIN_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_FILES = 10_000;
 const MAX_MAX_FILES = 100_000;
+const DEFAULT_MAX_DIRECTORIES = 1_000;
+const MAX_MAX_DIRECTORIES = 100_000;
+const DEFAULT_MAX_DEPTH = 32;
+const MAX_MAX_DEPTH = 256;
+const DEFAULT_MAX_ENTRIES = 100_000;
+const MAX_MAX_ENTRIES = 1_000_000;
+/** Entries read between yields to the event loop, so a stop can land mid-scan. */
+const YIELD_EVERY = 256;
 
 /** A shell-style name mask ("*.pdf", "*.{png,jpg}", "a?.txt"; several separated by commas) as a test. Case-insensitive. */
 export function maskTest(mask: string): RegExp {
@@ -56,6 +78,12 @@ export const folderSourceType: SourceType = {
     recursive: { type: "boolean", description: "also look in folders inside it (default true)" },
     every: { type: "string", description: 'how often to scan, at least "1s" (default "5s")' },
     maxFiles: { type: "number", description: `refuse a scan that finds more files than this (default ${DEFAULT_MAX_FILES})` },
+    maxDirectories: { type: "number", description: `refuse a scan that finds more folders than this (default ${DEFAULT_MAX_DIRECTORIES})` },
+    maxDepth: { type: "number", description: `refuse a scan that finds folders nested deeper than this (default ${DEFAULT_MAX_DEPTH})` },
+    maxEntries: {
+      type: "number",
+      description: `refuse a scan that reads more directory entries than this, ignored ones included (default ${DEFAULT_MAX_ENTRIES})`,
+    },
   },
   plan(o) {
     const dir = String(o.dir);
@@ -71,62 +99,139 @@ export const folderSourceType: SourceType = {
     if (o.mask !== undefined) maskTest(String(o.mask));
     const every = (o.every as string | undefined) ?? "5s";
     if (parseDuration(every) < MIN_INTERVAL_MS) throw new Error(`folder: "every" must be at least "1s"`);
-    const maxFiles = (o.maxFiles as number | undefined) ?? DEFAULT_MAX_FILES;
-    if (!Number.isInteger(maxFiles) || maxFiles < 1 || maxFiles > MAX_MAX_FILES) throw new Error(`folder: "maxFiles" must be an integer from 1 to ${MAX_MAX_FILES}`);
+    const bound = (key: string, fallback: number, max: number) => {
+      const v = (o[key] as number | undefined) ?? fallback;
+      if (!Number.isInteger(v) || v < 1 || v > max) throw new Error(`folder: "${key}" must be an integer from 1 to ${max}`);
+      return v;
+    };
+    const maxFiles = bound("maxFiles", DEFAULT_MAX_FILES, MAX_MAX_FILES);
+    const maxDirectories = bound("maxDirectories", DEFAULT_MAX_DIRECTORIES, MAX_MAX_DIRECTORIES);
+    const maxDepth = bound("maxDepth", DEFAULT_MAX_DEPTH, MAX_MAX_DEPTH);
+    const maxEntries = bound("maxEntries", DEFAULT_MAX_ENTRIES, MAX_MAX_ENTRIES);
     const only = [o.mask ? `files named ${o.mask}` : "", o.pattern ? `paths matching ${o.pattern}` : ""].filter(Boolean).join(", ");
     return {
-      options: { ...o, dir: real, every, maxFiles, recursive: o.recursive !== false },
-      does: [`scan ${real}${o.recursive === false ? "" : " and the folders inside it"} every ${every} and report new and changed files${only ? ` (${only})` : ""}`],
+      options: { ...o, dir: real, every, maxFiles, maxDirectories, maxDepth, maxEntries, recursive: o.recursive !== false },
+      does: [
+        `scan ${real}${o.recursive === false ? "" : " and the folders inside it"} every ${every} and report new and changed files${only ? ` (${only})` : ""}`,
+        `fail a scan that finds more than ${maxFiles} files, ${maxDirectories} folders, ${maxEntries} entries or folders ${maxDepth} deep, or sees the folder replaced`,
+      ],
       opens: true,
     };
   },
   start(api: SourceApi) {
-    const o = api.options as { dir: string; mask?: string; pattern?: string; ignore?: string; recursive: boolean; every: string; maxFiles: number };
+    const o = api.options as {
+      dir: string;
+      mask?: string;
+      pattern?: string;
+      ignore?: string;
+      recursive: boolean;
+      every: string;
+      maxFiles: number;
+      maxDirectories: number;
+      maxDepth: number;
+      maxEntries: number;
+    };
     const root = o.dir;
     const mask = o.mask ? maskTest(o.mask) : undefined;
     const pattern = o.pattern ? new RegExp(o.pattern, "i") : undefined;
     const ignore = new RegExp(o.ignore ?? DEFAULT_IGNORE, "i");
 
-    const scan = (): Map<string, { size: number; sig: string }> => {
+    type Identity = { dev: number; ino: number };
+    const replaced = () => new SourceError("the folder, or a folder inside it, was replaced while it was watched");
+    /** The folder at `path` is a real folder (no link anywhere on the way), the very one seen before. */
+    const verify = (path: string, expected: Identity | undefined): Identity => {
+      let st: ReturnType<typeof lstatSync>;
+      let real: string;
+      try {
+        st = lstatSync(path);
+        real = realpathSync(path);
+      } catch {
+        if (path === root) throw new SourceError("the folder cannot be read");
+        throw replaced();
+      }
+      if (!st.isDirectory() || real !== path) throw replaced();
+      if (expected && (st.dev !== expected.dev || st.ino !== expected.ino)) throw replaced();
+      return { dev: st.dev, ino: st.ino };
+    };
+    // Pinned when the source starts: a later scan reads this folder or nothing.
+    const pinned = verify(root, undefined);
+
+    const scan = async (signal: AbortSignal): Promise<Map<string, { size: number; sig: string }>> => {
       const found = new Map<string, { size: number; sig: string }>();
-      const walk = (dir: string) => {
-        let entries: Dirent[];
-        try {
-          entries = readdirSync(dir, { withFileTypes: true });
-        } catch {
-          if (dir === root) throw new SourceError("the folder cannot be read");
-          return;
-        }
-        for (const entry of entries) {
-          const full = join(dir, entry.name);
-          const rel = relative(root, full).split(sep).join("/");
-          if (ignore.test(rel)) continue;
-          // Never follow a link: it may lead out of the folder.
-          if (entry.isSymbolicLink()) continue;
-          if (entry.isDirectory()) {
-            if (o.recursive) walk(full);
-            continue;
-          }
-          if (!entry.isFile()) continue;
-          if (mask && !mask.test(entry.name)) continue;
-          if (pattern && !pattern.test(rel)) continue;
-          let size: number;
-          let mtimeMs: number;
-          try {
-            ({ size, mtimeMs } = statSync(full));
-          } catch {
-            continue;
-          }
-          found.set(rel, { size, sig: `${size}:${mtimeMs}` });
-          if (found.size > o.maxFiles) throw new SourceError(`more than ${o.maxFiles} files; narrow the folder, mask or pattern`);
-        }
+      const queue: Array<{ path: string; rel: string; depth: number; id: Identity }> = [{ path: root, rel: "", depth: 0, id: pinned }];
+      let directories = 0;
+      let entries = 0;
+      const stopped = () => {
+        if (signal.aborted) throw new Error("stopped");
       };
-      walk(root);
+      for (let next = queue.shift(); next; next = queue.shift()) {
+        const { path, rel, depth, id } = next;
+        verify(path, id);
+        let dir: Dir;
+        try {
+          dir = opendirSync(path);
+        } catch {
+          if (path === root) throw new SourceError("the folder cannot be read");
+          continue;
+        }
+        try {
+          for (let entry = dir.readSync(); entry; entry = dir.readSync()) {
+            stopped();
+            entries++;
+            if (entries > o.maxEntries) throw new SourceError(`more than ${o.maxEntries} entries; narrow the folder or the ignore list`);
+            if (entries % YIELD_EVERY === 0) {
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              stopped();
+            }
+            const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+            if (ignore.test(childRel)) continue;
+            // Never follow a link: it may lead out of the folder.
+            if (entry.isSymbolicLink()) continue;
+            const full = join(path, entry.name);
+            if (entry.isDirectory()) {
+              if (!o.recursive) continue;
+              if (depth + 1 > o.maxDepth) throw new SourceError(`folders nested more than ${o.maxDepth} deep; narrow the folder`);
+              directories++;
+              if (directories > o.maxDirectories) throw new SourceError(`more than ${o.maxDirectories} folders; narrow the folder or the ignore list`);
+              let st: ReturnType<typeof lstatSync>;
+              try {
+                st = lstatSync(full);
+              } catch {
+                continue;
+              }
+              // Replaced by a link or a file since it was listed: not followed.
+              if (!st.isDirectory()) continue;
+              queue.push({ path: full, rel: childRel, depth: depth + 1, id: { dev: st.dev, ino: st.ino } });
+              continue;
+            }
+            if (!entry.isFile()) continue;
+            if (mask && !mask.test(entry.name)) continue;
+            if (pattern && !pattern.test(childRel)) continue;
+            let st: ReturnType<typeof lstatSync>;
+            try {
+              st = lstatSync(full);
+            } catch {
+              continue;
+            }
+            if (!st.isFile()) continue;
+            found.set(childRel, { size: st.size, sig: `${st.size}:${st.mtimeMs}` });
+            if (found.size > o.maxFiles) throw new SourceError(`more than ${o.maxFiles} files; narrow the folder, mask or pattern`);
+          }
+        } finally {
+          try {
+            dir.closeSync();
+          } catch {
+            // Already closed.
+          }
+        }
+        // Still the same folder, at the same place, now that it has been read.
+        verify(path, id);
+      }
       return found;
     };
 
-    api.poll(o.every, async () => {
-      const files = scan();
+    api.poll(o.every, async (signal) => {
+      const files = await scan(signal);
       const memory = await api.state.get<FolderMemory>("files");
       if (!memory) {
         // The first scan is the starting point: what is there already is not news.

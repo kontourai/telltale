@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { maskTest } from "../../dist/index.js";
@@ -107,4 +107,76 @@ test("maskTest", () => {
   assert.ok(maskTest("*.{png,jpg}").test("x.jpg"));
   assert.ok(maskTest("a?.txt, b*.md").test("bee.md"));
   assert.ok(!maskTest("*.pdf").test("x.pdf.exe"));
+});
+
+// ---- Fix round 1 -------------------------------------------------------------
+
+test("a folder replaced by a link to another folder after the starting point is not read: the scan fails", async (t) => {
+  const { dir, events, host, scan } = await watch(t);
+  const outside = folder(t);
+  put(outside, "private.txt", "outside data");
+  const moved = `${dir}-moved`;
+  t.after(() => rmSync(moved, { recursive: true, force: true }));
+  renameSync(dir, moved);
+  symlinkSync(outside, dir);
+  t.after(() => rmSync(dir, { force: true }));
+  await scan();
+  await scan();
+  assert.deepEqual(events, [], "nothing from the other folder was reported");
+  assert.equal(host.status("drop").state, "failing");
+  assert.match(host.status("drop").error, /replaced/);
+});
+
+test("a folder replaced by another real folder at the same path is not read either", async (t) => {
+  const { dir, events, host, scan } = await watch(t);
+  const moved = `${dir}-moved`;
+  t.after(() => rmSync(moved, { recursive: true, force: true }));
+  renameSync(dir, moved);
+  mkdirSync(dir);
+  put(dir, "planted.txt", "a different folder");
+  await scan();
+  await scan();
+  assert.deepEqual(events, []);
+  assert.match(host.status("drop").error, /replaced/);
+});
+
+async function bounded(t, build, options) {
+  const dir = folder(t);
+  build(dir);
+  const ctx = newHost();
+  ctx.host.add({ id: "drop", type: "folder", options: { dir, every: "1s", ...options } });
+  await collect(ctx.host, "drop");
+  await ctx.clock.advance(0);
+  return ctx.host.status("drop");
+}
+
+test("traversal is bounded by folders, depth and entries read, not only by files found", async (t) => {
+  // The reviewer's case: maxFiles 1 and 1,200 empty folders.
+  const many = await bounded(t, (d) => {
+    for (let i = 0; i < 1200; i++) mkdirSync(join(d, `d${i}`));
+  }, { maxFiles: 1 });
+  assert.equal(many.state, "failing");
+  assert.match(many.error, /more than 1000 folders/);
+
+  const deep = await bounded(t, (d) => mkdirSync(join(d, "a/b/c/d/e"), { recursive: true }), { maxDepth: 3 });
+  assert.match(deep.error, /more than 3 deep/);
+
+  // Entries count even when every one is ignored or filtered out.
+  const noisy = await bounded(t, (d) => {
+    for (let i = 0; i < 50; i++) put(d, `f${i}.tmp`, "x");
+  }, { maxEntries: 20 });
+  assert.match(noisy.error, /more than 20 entries/);
+
+  const within = await bounded(t, (d) => {
+    for (let i = 0; i < 5; i++) mkdirSync(join(d, `d${i}`));
+  }, { maxDirectories: 5, maxEntries: 5 });
+  assert.equal(within.state, "running", "at the bound is allowed; max + 1 is refused");
+});
+
+test("bounds are checked at plan time", () => {
+  const { host } = newHost();
+  const dir = tmpdir();
+  for (const key of ["maxDirectories", "maxDepth", "maxEntries"]) {
+    assert.throws(() => host.plan("folder", { dir, [key]: 0 }), new RegExp(key));
+  }
 });
