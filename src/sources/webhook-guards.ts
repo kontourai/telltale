@@ -9,6 +9,7 @@
  * budget whose post-trip noise is aggregated). See docs/design.md.
  */
 
+import { randomUUID } from "node:crypto";
 import type { Clock } from "../clock.js";
 import type { MaybePromise } from "../types.js";
 import { digest } from "../util.js";
@@ -50,30 +51,44 @@ export interface WebhookCredentials {
   lookup(credentialId: string): MaybePromise<WebhookLookup>;
 }
 
+/** What `reserve` answers: the key is now yours (with the token that proves it), or someone has it already. */
+export type ReplayReservation = { outcome: "reserved"; token: string } | { outcome: "replayed" };
+
 /**
  * Remembers which authenticated requests were already delivered, as a small
- * state machine per key: `reserve` takes a free key (reserved), `commit`
- * marks it delivered after every subscriber took the event, and `release`
- * frees a reservation whose delivery failed so the same request can be sent
- * again. A reserved or delivered key refuses another `reserve`, so two
- * concurrent copies of one request are never both delivered.
+ * state machine per key. `reserve` takes a free key and returns a token, an
+ * opaque proof of ownership. `extend` (while delivery runs), `commit` (every
+ * subscriber took the event) and `release` (delivery failed, so the same
+ * request may be sent again) act only when the token still owns the key, and
+ * answer whether they did. A reserved or delivered key refuses another
+ * `reserve`, so two copies of one request are never delivered at once.
  *
  * `reserve` is called only after the request authenticated, so an
- * unauthenticated caller can never burn or lock a key. It must be atomic per
- * key. Throw when it cannot decide (a corrupt or full ledger): the request is
- * refused `policy_unavailable`, so replay protection is never silently
- * removed.
+ * unauthenticated caller can never burn or lock a key. Throw when you cannot
+ * decide (a corrupt or full ledger): the request is refused
+ * `policy_unavailable`, so replay protection is never silently removed.
  *
- * `expiresAt` is the first instant at which the request the key guards is no
- * longer accepted (stale, or past retention). Keep the key while
- * `now < expiresAt`; forget it only when `now >= expiresAt`. A reservation
- * that is never committed or released (the process stopped mid-delivery) may
- * be held until `expiresAt`.
+ * **Atomicity is the implementer's obligation.** `reserve` must check and
+ * take the key in one atomic step (a transaction, a compare-and-set, a unique
+ * insert); a read, an await and then a write lets two concurrent copies both
+ * reserve. `extend`, `commit` and `release` must compare the token and change
+ * the entry in the same atomic step, so an owner whose reservation expired
+ * and was taken by a newer request cannot touch the newer one.
+ *
+ * `expiresAt` is the first instant at which the key is free again. Keep the
+ * key while `now < expiresAt`; forget it only when `now >= expiresAt`. A
+ * webhook extends its reservation while delivery runs, so a slow subscriber
+ * never lets the key lapse under it; a reservation whose holder stopped (a
+ * crash) lapses at its last `expiresAt`.
  */
 export interface ReplayLedger {
-  reserve(key: string, expiresAt: number, now: number): MaybePromise<"reserved" | "replayed">;
-  commit(key: string, now: number): MaybePromise<void>;
-  release(key: string, now: number): MaybePromise<void>;
+  reserve(key: string, expiresAt: number, now: number): MaybePromise<ReplayReservation>;
+  /** Move a live reservation's expiry later. `false`: the token no longer owns a live reservation. */
+  extend(key: string, token: string, expiresAt: number, now: number): MaybePromise<boolean>;
+  /** Mark the token's reservation delivered. `false`: the token no longer owns the key; nothing changed. */
+  commit(key: string, token: string, now: number): MaybePromise<boolean>;
+  /** Free the token's reservation. `false`: the token no longer owns a reservation; nothing changed. */
+  release(key: string, token: string, now: number): MaybePromise<boolean>;
 }
 
 export class ReplayLedgerFullError extends Error {
@@ -90,29 +105,42 @@ export class ReplayLedgerFullError extends Error {
  * close.
  */
 export class InMemoryReplayLedger implements ReplayLedger {
-  readonly #keys = new Map<string, { expiresAt: number; state: "reserved" | "delivered" }>();
+  readonly #keys = new Map<string, { expiresAt: number; state: "reserved" | "delivered"; token: string }>();
 
   constructor(readonly maxEntries = 10_000) {}
 
-  reserve(key: string, expiresAt: number, now: number): "reserved" | "replayed" {
+  reserve(key: string, expiresAt: number, now: number): ReplayReservation {
     const existing = this.#keys.get(key);
-    if (existing !== undefined && now < existing.expiresAt) return "replayed";
+    if (existing !== undefined && now < existing.expiresAt) return { outcome: "replayed" };
     if (existing !== undefined) this.#keys.delete(key);
     if (this.#keys.size >= this.maxEntries) {
       for (const [k, entry] of this.#keys) if (now >= entry.expiresAt) this.#keys.delete(k);
       if (this.#keys.size >= this.maxEntries) throw new ReplayLedgerFullError(this.maxEntries);
     }
-    this.#keys.set(key, { expiresAt, state: "reserved" });
-    return "reserved";
+    const token = randomUUID();
+    this.#keys.set(key, { expiresAt, state: "reserved", token });
+    return { outcome: "reserved", token };
   }
 
-  commit(key: string): void {
+  extend(key: string, token: string, expiresAt: number, now: number): boolean {
     const entry = this.#keys.get(key);
-    if (entry) entry.state = "delivered";
+    if (entry?.token !== token || entry.state !== "reserved" || now >= entry.expiresAt) return false;
+    entry.expiresAt = Math.max(entry.expiresAt, expiresAt);
+    return true;
   }
 
-  release(key: string): void {
-    if (this.#keys.get(key)?.state === "reserved") this.#keys.delete(key);
+  commit(key: string, token: string): boolean {
+    const entry = this.#keys.get(key);
+    if (entry?.token !== token) return false;
+    entry.state = "delivered";
+    return true;
+  }
+
+  release(key: string, token: string): boolean {
+    const entry = this.#keys.get(key);
+    if (entry?.token !== token || entry.state !== "reserved") return false;
+    this.#keys.delete(key);
+    return true;
   }
 
   get size(): number {

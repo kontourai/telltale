@@ -643,3 +643,173 @@ test("plan() and list() redact a copy of a secret wherever it appears, before an
   host.add({ id: "gh", type: "webhook", options });
   assert.ok(!JSON.stringify(host.list()).includes(secret), "a copy of the secret leaked from list()");
 });
+
+// ---- Fix round 2 -------------------------------------------------------------
+
+async function slowGithubHook(bindings = {}) {
+  const ctx = await githubHook({ retentionHours: 1 }, bindings);
+  let count = 0;
+  const gates = [];
+  const outcomes = [];
+  await ctx.host.subscribe("gh", async () => {
+    const n = count++;
+    await new Promise((resolve) => (gates[n] = resolve));
+    if (outcomes[n] === "fail") throw new Error(`delivery ${n} failed`);
+  });
+  const body = '{"action":"completed"}';
+  const send = () => ctx.host.receive("gh", { headers: { "x-hub-signature-256": ghSign(body), "x-github-delivery": "guid" }, body });
+  return { ...ctx, send, gates, outcomes, attempts: () => count };
+}
+
+test("a delivery slower than the key's lifetime keeps its reservation: an identical request is refused meanwhile", async () => {
+  const c = await slowGithubHook();
+  c.outcomes[0] = "fail";
+  const a = c.send();
+  await settle();
+  await c.clock.advance(3_600_001);
+  const b = await c.send();
+  assert.equal(b.reason, "replay", "the reservation was extended while A was delivering");
+  assert.equal(c.attempts(), 1);
+  c.gates[0]();
+  assert.equal((await a).status, 503);
+  const retry = c.send();
+  await settle();
+  c.gates[1]();
+  assert.equal((await retry).status, 202, "A's own release freed the key for a retry");
+  assert.equal(c.attempts(), 2, "A, then its retry; B was never delivered");
+});
+
+/** A ledger that cannot extend: the lease lapses under a slow delivery, so ownership must protect the newer holder. */
+function noExtendLedger() {
+  const inner = new InMemoryReplayLedger();
+  return {
+    reserve: (...a) => inner.reserve(...a),
+    extend: () => false,
+    commit: (...a) => inner.commit(...a),
+    release: (...a) => inner.release(...a),
+  };
+}
+
+test("an owner whose reservation lapsed cannot release the newer owner's: no two copies are in flight at once", async () => {
+  const c = await slowGithubHook({ replay: noExtendLedger() });
+  c.outcomes[0] = "fail";
+  const a = c.send();
+  await settle();
+  await c.clock.advance(3_600_001);
+  const b = c.send(); // A's key lapsed: B reserves it.
+  await settle();
+  assert.equal(c.attempts(), 2);
+  c.gates[0]();
+  assert.equal((await a).status, 503);
+  const third = await c.send();
+  assert.equal(third.reason, "replay", "A's late release did not free B's reservation");
+  assert.equal(c.attempts(), 2);
+  assert.ok(c.log.lines.some((l) => l.includes("replay_release_not_owned")), "the mismatch is reported");
+  c.gates[1]();
+  assert.equal((await b).status, 202);
+});
+
+test("an owner whose reservation lapsed cannot commit the newer owner's: the newer one's failure still frees the key", async () => {
+  const c = await slowGithubHook({ replay: noExtendLedger() });
+  c.outcomes[1] = "fail";
+  const a = c.send();
+  await settle();
+  await c.clock.advance(3_600_001);
+  const b = c.send();
+  await settle();
+  c.gates[0]();
+  assert.equal((await a).status, 202);
+  assert.ok(c.log.lines.some((l) => l.includes("replay_commit_not_owned")));
+  c.gates[1]();
+  assert.equal((await b).status, 503);
+  const retry = c.send();
+  await settle();
+  c.gates[2]();
+  assert.equal((await retry).status, 202, "B's failure was not turned into a delivered key by A's late commit");
+});
+
+test("the in-memory ledger acts only for the token that owns a key", () => {
+  const ledger = new InMemoryReplayLedger();
+  const a = ledger.reserve("k", 100, 0);
+  assert.equal(a.outcome, "reserved");
+  assert.deepEqual(ledger.reserve("k", 100, 50), { outcome: "replayed" });
+  assert.equal(ledger.extend("k", a.token, 150, 60), true);
+  assert.deepEqual(ledger.reserve("k", 300, 120), { outcome: "replayed" }, "extended past its first expiry");
+  const b = ledger.reserve("k", 400, 150);
+  assert.equal(b.outcome, "reserved", "free again at the extended expiry");
+  assert.equal(ledger.release("k", a.token), false);
+  assert.equal(ledger.commit("k", a.token), false);
+  assert.equal(ledger.extend("k", a.token, 900, 160), false);
+  assert.equal(ledger.state("k"), "reserved", "B's reservation is untouched");
+  assert.equal(ledger.commit("k", b.token), true);
+  assert.equal(ledger.release("k", b.token), false, "a delivered key is not released");
+  assert.equal(ledger.state("k"), "delivered");
+});
+
+test("a ledger answering in the old shape fails closed", async () => {
+  const { host, events } = await setup({ bindings: { replay: { reserve: () => "reserved", extend() {}, commit() {}, release() {} } } });
+  assert.equal((await host.receive("inbound", request(BODY))).reason, "policy_unavailable");
+  assert.equal(events.length, 0);
+});
+
+test("an unsubscribe and a new subscriber keep the default budget spent", async () => {
+  // The per-credential limit is far away, so only the budget can refuse here.
+  const ctx = newHost({ start: START });
+  ctx.host.add({
+    id: "inbound",
+    type: "webhook",
+    options: { secret: SECRET, unauthenticatedPerMinute: 3, perCredentialPerMinute: 1000 },
+  });
+  const { subscription } = await collect(ctx.host, "inbound");
+  const signed = (n = nonce()) => ({
+    headers: { "x-telltale-timestamp": ts(), "x-telltale-nonce": n, "x-telltale-signature": sign(BODY, n) },
+    body: BODY,
+  });
+  for (let i = 0; i < 3; i++) {
+    const bad = signed();
+    bad.headers["x-telltale-signature"] = `sha256=${"0".repeat(64)}`;
+    assert.equal((await ctx.host.receive("inbound", bad)).reason, "invalid_signature");
+  }
+  const spent = await ctx.host.receive("inbound", signed());
+  assert.deepEqual([spent.reason, spent.retryAfterSeconds], ["rate_limited", undefined], "the budget refused, not the limiter");
+  await subscription.unsubscribe();
+  await collect(ctx.host, "inbound");
+  const afterChurn = await ctx.host.receive("inbound", signed());
+  assert.deepEqual([afterChurn.reason, afterChurn.retryAfterSeconds], ["rate_limited", undefined], "a new subscriber got no fresh budget");
+  await ctx.clock.advance(60_000);
+  assert.equal((await ctx.host.receive("inbound", signed())).status, 202, "and the window still clears it");
+});
+
+test("a stop does not wait on a body that never arrives, and gives its admission back", async () => {
+  const budget = new FailureBudget(1, 60_000);
+  const { host, subscription } = await setup({ bindings: { budget } });
+  const stalled = host.receive("inbound", request(BODY, { bodyReader: () => new Promise(() => {}) }));
+  await settle();
+  assert.equal(budget.inflight, 1);
+  await subscription.unsubscribe();
+  assert.deepEqual([(await stalled).status, (await stalled).reason], [404, "not_listening"]);
+  assert.equal(budget.inflight, 0, "the admission was returned");
+  await collect(host, "inbound");
+  assert.equal((await host.receive("inbound", request(BODY))).status, 202);
+});
+
+test("close() waits for a webhook subscriber still taking a request, and refuses new requests meanwhile", async () => {
+  const { host } = await setup();
+  let finish;
+  const order = [];
+  await host.subscribe("inbound", async () => {
+    await new Promise((resolve) => (finish = resolve));
+    order.push("subscriber done");
+  });
+  const pending = host.receive("inbound", request(BODY)).then((r) => (order.push(`request ${r.status}`), r));
+  await settle();
+  const closing = host.close().then(() => order.push("closed"));
+  await settle();
+  assert.deepEqual(order, [], "close() is waiting");
+  const late = await host.receive("inbound", request(BODY));
+  assert.deepEqual([late.status, late.reason], [404, "not_listening"]);
+  finish();
+  await closing;
+  await pending;
+  assert.deepEqual(order, ["subscriber done", "request 202", "closed"]);
+});

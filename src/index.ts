@@ -49,6 +49,7 @@ export {
 } from "./sources/webhook-guards.js";
 export type {
   ReplayLedger,
+  ReplayReservation,
   UnauthenticatedBudget,
   WebhookAudit,
   WebhookAuditEntry,

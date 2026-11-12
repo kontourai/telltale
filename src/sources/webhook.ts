@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { ReceivedRequest, ReceiveResult, SourceApi, SourceType } from "../source-type.js";
 import { DeliveryError, SourceStoppedError } from "../source-type.js";
+import type { MaybePromise } from "../types.js";
 import { digest, isRecord, timingSafeEqualText } from "../util.js";
 import {
   AttemptLimiter,
@@ -10,6 +11,7 @@ import {
   MIN_WEBHOOK_SECRET_LENGTH,
   NoiseAggregator,
   type ReplayLedger,
+  type ReplayReservation,
   type WebhookAudit,
   type WebhookAuditEntry,
   type WebhookCredential,
@@ -95,6 +97,8 @@ const DEFAULT_RETENTION_HOURS = 168;
 const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 const MAX_MAX_BODY_BYTES = 10 * 1024 * 1024;
 const RATE_WINDOW_MS = 60_000;
+/** The shortest lease a reservation is extended by while its delivery runs. */
+const MIN_LEASE_MS = 60_000;
 const DEFAULT_PER_CREDENTIAL_PER_MINUTE = 60;
 const DEFAULT_UNAUTHENTICATED_PER_MINUTE = 300;
 
@@ -234,6 +238,20 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
     const noise = new NoiseAggregator(api.clock, (count) => record("unauthenticated_flood", undefined, count));
     api.onStop(() => noise.stop());
 
+    // Every wait on something outside Telltale before delivery (the credential
+    // store, the body, the ledger) ends when the source stops, so a stop never
+    // waits on a reader that does not settle, and its admission is returned.
+    const untilStopped = <T>(work: () => MaybePromise<T>): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        if (api.signal.aborted) return reject(new SourceStoppedError(api.id));
+        const onAbort = () => reject(new SourceStoppedError(api.id));
+        api.signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve()
+          .then(work)
+          .then(resolve, reject)
+          .finally(() => api.signal.removeEventListener("abort", onAbort));
+      });
+
     const verify = async (request: ReceivedRequest, authenticated: () => void): Promise<ReceiveResult> => {
       const now = api.clock.now();
       const header = headerReader(request.headers);
@@ -254,7 +272,7 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
       const credentialId = presented && CREDENTIAL_ID.test(presented) ? presented : undefined;
       let credential: { id: string; secret: unknown; revoked: boolean } | undefined;
       try {
-        const lookup: WebhookLookup = await credentials.lookup(credentialId ?? "");
+        const lookup: WebhookLookup = await untilStopped(() => credentials.lookup(credentialId ?? ""));
         if (!isRecord(lookup) || lookup.enabled !== true) {
           return lookup?.enabled === false ? refuse("disabled", credentialId) : refuse("policy_unavailable", credentialId);
         }
@@ -263,7 +281,8 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
         // the signature must use the secret that was registered for redaction.
         const found: WebhookCredential | undefined = credentialId ? lookup.credential : undefined;
         if (isRecord(found)) credential = { id: found.id, secret: found.secret, revoked: found.revokedAt !== undefined };
-      } catch {
+      } catch (error) {
+        if (error instanceof SourceStoppedError) throw error;
         // Never the exception text: a store's message may quote a secret or a path.
         api.log.warn("webhook credentials unavailable", { code: "credential_lookup_failed" });
         return refuse("policy_unavailable", credentialId);
@@ -307,7 +326,7 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
       }
 
       // 5. The body, only now, bounded.
-      const body = await readBody(request.body, p.maxBodyBytes);
+      const body = await untilStopped(() => readBody(request.body, p.maxBodyBytes));
       if (!body) return refuse("malformed_request", credential.id);
       const received = api.clock.now();
       // A body that took longer than the window to arrive is stale by now.
@@ -339,24 +358,77 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
         replayKey = digest(credential.id, "bearer-delivery", deliveryId);
         expiresAt = received + p.retentionHours * 3_600_000;
       }
+      let token: string | undefined;
       if (replayKey !== undefined) {
-        let reserved: "reserved" | "replayed";
+        const key = replayKey;
+        let reservation: ReplayReservation;
+        const asked = Promise.resolve().then(() => replay.reserve(key, expiresAt, received));
         try {
-          reserved = await replay.reserve(replayKey, expiresAt, received);
-        } catch {
+          reservation = await untilStopped(() => asked);
+        } catch (error) {
+          if (error instanceof SourceStoppedError) {
+            // Stopped while the ledger was answering: give back a reservation that still arrives.
+            void asked
+              .then((late) =>
+                isRecord(late) && late.outcome === "reserved" && typeof late.token === "string"
+                  ? replay.release(key, late.token, api.clock.now())
+                  : undefined,
+              )
+              .catch(() => {});
+            throw error;
+          }
           api.log.warn("webhook replay ledger unavailable", { code: "replay_reserve_failed" });
           return refuse("policy_unavailable", credential.id);
         }
-        if (reserved === "replayed") return refuse("replay", credential.id);
+        if (!isRecord(reservation) || (reservation.outcome === "reserved" ? typeof reservation.token !== "string" : reservation.outcome !== "replayed")) {
+          api.log.warn("webhook replay ledger unavailable", { code: "replay_reserve_malformed" });
+          return refuse("policy_unavailable", credential.id);
+        }
+        if (reservation.outcome === "replayed") return refuse("replay", credential.id);
+        token = reservation.token;
       }
       const settle = async (outcome: "commit" | "release") => {
-        if (replayKey === undefined) return;
+        if (replayKey === undefined || token === undefined) return;
         try {
-          await (outcome === "commit" ? replay.commit(replayKey, api.clock.now()) : replay.release(replayKey, api.clock.now()));
+          const owned =
+            outcome === "commit"
+              ? await replay.commit(replayKey, token, api.clock.now())
+              : await replay.release(replayKey, token, api.clock.now());
+          // The token no longer owns the key: nothing was changed, and a newer owner is untouched.
+          if (owned !== true) api.log.warn("webhook replay reservation was not ours", { code: `replay_${outcome}_not_owned` });
         } catch {
           // A failed commit keeps the reservation (still refusing replays); a failed release only delays a retry.
           api.log.warn("webhook replay ledger unavailable", { code: `replay_${outcome}_failed` });
         }
+      };
+      // While delivery runs, keep the reservation alive, so a subscriber slower
+      // than the key's lifetime never lets an identical request reserve it.
+      let delivering = true;
+      let renewal: unknown;
+      const lifetime = Math.max(expiresAt - received, MIN_LEASE_MS);
+      const renewIn = (until: number) => {
+        if (!delivering || replayKey === undefined || token === undefined) return;
+        renewal = api.clock.setTimer(renew, Math.max(1, (until - api.clock.now()) / 2));
+      };
+      const renew = () => {
+        renewal = undefined;
+        const now = api.clock.now();
+        const until = now + lifetime;
+        void Promise.resolve()
+          .then(() => replay.extend(replayKey!, token!, until, now))
+          .then(
+            (owned) => {
+              if (owned === true) renewIn(until);
+              else api.log.warn("webhook replay reservation lapsed during delivery", { code: "replay_extend_not_owned" });
+            },
+            () => api.log.warn("webhook replay ledger unavailable", { code: "replay_extend_failed" }),
+          );
+      };
+      renewIn(expiresAt);
+      const stopRenewing = () => {
+        delivering = false;
+        if (renewal !== undefined) api.clock.clearTimer(renewal);
+        renewal = undefined;
       };
 
       // 8. Report it.
@@ -371,9 +443,11 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
           : `${p.scheme === "bearer" ? "delivery" : "request"}:${replayKey}`;
       try {
         const event = await api.emit("received", payload, { dedupKey, ...(deliveryId ? { deliveryId } : {}) });
+        stopRenewing();
         await settle("commit");
         return { accepted: true, status: 202, event };
       } catch (error) {
+        stopRenewing();
         // Not delivered: free the key, so the same request, sent again, is delivered.
         await settle("release");
         if (error instanceof SourceStoppedError) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
@@ -401,6 +475,9 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
       };
       try {
         return await verify(request, done);
+      } catch (error) {
+        if (error instanceof SourceStoppedError) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
+        throw error;
       } finally {
         done();
       }
