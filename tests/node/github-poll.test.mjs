@@ -233,3 +233,55 @@ test("listing: bounded, never paginated, failures classified", async () => {
   assert.equal((await of(new Response(JSON.stringify({ total_count: 1, workflow_runs: Array(25).fill({}) })))).outcome, "unavailable");
   await assert.rejects(listGitHubWorkflowRuns({ repository: "not a repo" }), /owner\/repo/);
 });
+
+// ---- Fix round 1 -------------------------------------------------------------
+
+test("a refused run does not suppress a later valid observation of it: a future-dated run is delivered once time catches up", async () => {
+  const future = workflowRun({ updatedAt: iso(T0 + 60_000) });
+  const { host, clock } = pollSetup({ runs: () => [future], options: { backfill: true } });
+  const { events, refusals } = await collect(host, "ci");
+  await clock.advance(0);
+  assert.deepEqual(refusals.map((r) => r.reason), ["malformed_request"]);
+  await clock.advance(5 * 60_000);
+  assert.equal(events.length, 1, "the run, now in the past, is reported");
+  assert.equal(events[0].dedupKey, "workflow_run:37423043587:1:completed");
+  await clock.advance(5 * 60_000);
+  assert.equal(events.length, 1, "and only once");
+  assert.equal(refusals.length, 1, "the refusal was not repeated");
+});
+
+function countWrites(state) {
+  const writes = { count: 0 };
+  const set = state.set.bind(state);
+  state.set = (...args) => {
+    writes.count++;
+    return set(...args);
+  };
+  return writes;
+}
+
+test("an unchanged poll writes no state, with runs in the listing or with none", async () => {
+  for (const runs of [[workflowRun()], []]) {
+    const ctx = pollSetup({ runs: () => runs });
+    const writes = countWrites(ctx.state);
+    await collect(ctx.host, "ci");
+    await ctx.clock.advance(0);
+    assert.equal(writes.count, 1, "the starting point is written");
+    await ctx.clock.advance(5 * 60_000);
+    await ctx.clock.advance(5 * 60_000);
+    assert.equal(writes.count, 1, `an unchanged look wrote state (${runs.length} runs)`);
+    assert.equal(ctx.host.status("ci").state, "running");
+  }
+});
+
+test("a poll that finds a new run writes once", async () => {
+  let runs = [workflowRun()];
+  const ctx = pollSetup({ runs: () => runs });
+  const writes = countWrites(ctx.state);
+  const { events } = await collect(ctx.host, "ci");
+  await ctx.clock.advance(0);
+  runs = [workflowRun(), workflowRun({ id: 37423043588, updatedAt: iso(T0 + 60_000) })];
+  await ctx.clock.advance(5 * 60_000);
+  assert.equal(events.length, 1);
+  assert.equal(writes.count, 2);
+});

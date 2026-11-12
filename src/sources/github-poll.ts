@@ -298,6 +298,13 @@ interface PollMemory {
   cursor?: GitHubPollCursor;
   /** Keys already delivered (or taken as the starting point), with their run time, so the overlap re-read stays quiet. */
   seen: Record<string, number>;
+  /**
+   * Refusals already reported, by key: what was refused (reason and run time)
+   * and when to forget it. Kept apart from `seen`: a refused observation must
+   * not stop a later valid one of the same run (a future-dated run that time
+   * catches up with) from being delivered.
+   */
+  refused?: Record<string, { as: string; at: number }>;
 }
 
 export const githubPollSourceType: SourceType<GitHubPollBindings> = {
@@ -362,8 +369,15 @@ export const githubPollSourceType: SourceType<GitHubPollBindings> = {
         if (signal.aborted) return;
       }
       const observedAt = api.clock.now();
-      const memory: PollMemory = (await api.state.get<PollMemory>("poll")) ?? { seen: {} };
-      const step = githubPollStep({ listings, cursor: memory.cursor, repository: o.repository, observedAt, maxEventAgeMs });
+      const loaded = await api.state.get<PollMemory>("poll");
+      const memory: PollMemory = loaded ?? { seen: {} };
+      const refused = (memory.refused ??= {});
+      const before = loaded === undefined ? undefined : JSON.stringify(memory);
+      // The freshness floor moves with the clock. It is applied here, at every
+      // look, rather than stored, so a look that found nothing new writes nothing.
+      const floor = observedAt - maxEventAgeMs;
+      const cursor = memory.cursor === undefined ? undefined : { cursorMs: Math.max(memory.cursor.cursorMs ?? Number.NEGATIVE_INFINITY, floor) };
+      const step = githubPollStep({ listings, cursor, repository: o.repository, observedAt, maxEventAgeMs });
       if (step.outcome === "unauthorized" || step.outcome === "unavailable") {
         throw new SourceError(step.outcome === "unauthorized" ? "GitHub did not accept the credential" : "GitHub was unavailable");
       }
@@ -371,30 +385,38 @@ export const githubPollSourceType: SourceType<GitHubPollBindings> = {
       try {
         for (const obs of step.observations) {
           if (memory.seen[obs.semanticKey] !== undefined) continue;
-          if (!baseline) {
-            if (obs.kind === "refused") await api.refuse(obs.reason, { dedupKey: obs.semanticKey });
-            else {
-              await api.emit(WORKFLOW_RUN_COMPLETED, obs.fields, {
-                dedupKey: obs.semanticKey,
-                occurredAt: obs.updatedAtMs,
-              });
-            }
+          if (obs.kind === "refused") {
+            // The same refusal (same reason, same run time) is reported once.
+            const as = `${obs.reason}:${obs.updatedAtMs ?? ""}`;
+            if (refused[obs.semanticKey]?.as === as) continue;
+            if (!baseline) await api.refuse(obs.reason, { dedupKey: obs.semanticKey });
+            refused[obs.semanticKey] = { as, at: obs.updatedAtMs ?? observedAt };
+            continue;
           }
-          memory.seen[obs.semanticKey] = obs.updatedAtMs ?? observedAt;
+          if (!baseline) {
+            await api.emit(WORKFLOW_RUN_COMPLETED, obs.fields, {
+              dedupKey: obs.semanticKey,
+              occurredAt: obs.updatedAtMs,
+            });
+          }
+          memory.seen[obs.semanticKey] = obs.updatedAtMs;
+          delete refused[obs.semanticKey];
         }
-        // Only a poll whose every observation was taken moves the cursor.
-        memory.cursor = step.cursor;
+        // Only a poll whose every observation was taken moves the cursor, and
+        // only past the floor: the floor alone is not news.
+        const next = step.cursor;
+        const floorOnly = memory.cursor !== undefined && (next.cursorMs === undefined || next.cursorMs <= floor);
+        if (!floorOnly) memory.cursor = next;
       } finally {
         // Forget what the cursor has passed, and anything older than the freshness window:
         // such a run is refused as stale, and a page of newest runs does not bring it back.
-        const floor = Math.max(
-          (memory.cursor?.cursorMs ?? Number.NEGATIVE_INFINITY) - CURSOR_OVERLAP_MS,
-          observedAt - maxEventAgeMs - CURSOR_OVERLAP_MS,
-        );
-        for (const [k, at] of Object.entries(memory.seen)) if (at < floor) delete memory.seen[k];
-        await api.state.set("poll", memory);
+        const forgetBelow = Math.max(memory.cursor?.cursorMs ?? Number.NEGATIVE_INFINITY, floor) - CURSOR_OVERLAP_MS;
+        for (const [k, at] of Object.entries(memory.seen)) if (at < forgetBelow) delete memory.seen[k];
+        for (const [k, r] of Object.entries(refused)) if (r.at < forgetBelow) delete refused[k];
+        // An unchanged look writes nothing.
+        if (before === undefined || JSON.stringify(memory) !== before) await api.state.set("poll", memory);
       }
-      if (Object.keys(memory.seen).length > MAX_SEEN) {
+      if (Object.keys(memory.seen).length + Object.keys(refused).length > MAX_SEEN) {
         throw new SourceError(`more than ${MAX_SEEN} runs remembered inside the freshness window; pin workflowFiles`);
       }
       api.status(step.outcome === "partial" ? "last look saw a partial page" : "");
