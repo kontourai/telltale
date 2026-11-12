@@ -590,3 +590,45 @@ test("a security header given twice, in two spellings, is refused whichever come
     assert.equal(events.length, 0);
   }
 });
+
+test("a __proto__ key in a signed body stays data: one subscriber cannot change what the next one sees", async () => {
+  const { host } = await setup();
+  const seen = {};
+  await host.subscribe("inbound", (e) => {
+    try {
+      e.payload.body.__proto__.message = "changed by the first subscriber";
+    } catch {
+      seen.mutationRefused = true;
+    }
+    try {
+      e.payload.body.message = "added by the first subscriber";
+    } catch {
+      seen.additionRefused = true;
+    }
+  });
+  await host.subscribe("inbound", (e) => {
+    seen.inherited = e.payload.body.message;
+    seen.own = Object.getOwnPropertyDescriptor(e.payload.body, "__proto__")?.value?.message;
+    seen.prototype = Object.getPrototypeOf(e.payload.body);
+  });
+  const body = '{"__proto__":{"message":"original"}}';
+  const result = await host.receive("inbound", request(body));
+  assert.equal(result.status, 202);
+  assert.equal(seen.inherited, undefined, "nothing is inherited from the body");
+  assert.equal(seen.own, "original", "the __proto__ key is an own, unchanged data property");
+  assert.equal(seen.prototype, Object.prototype);
+  assert.ok(seen.mutationRefused && seen.additionRefused, "the whole payload is frozen");
+});
+
+test("plan() and list() redact a copy of a secret wherever it appears, before and after add", async () => {
+  const { host } = newHost({ start: START });
+  // The secret also used as a header name: a copy outside the option marked secret.
+  const options = { scheme: "signed-body", secret: SECRET, headers: { delivery: SECRET } };
+  const plan = host.plan("webhook", options);
+  assert.equal(plan.options.secret, "[secret]");
+  assert.ok(JSON.stringify(plan).includes("[redacted]"), "the check reached the copy");
+  assert.ok(!JSON.stringify(plan).includes(SECRET), "a copy of the secret leaked from plan()");
+  assert.equal(host.secrets.size, 0, "planning registers nothing with the host");
+  host.add({ id: "gh", type: "webhook", options });
+  assert.ok(!JSON.stringify(host.list()).includes(SECRET), "a copy of the secret leaked from list()");
+});

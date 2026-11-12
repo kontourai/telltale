@@ -196,10 +196,16 @@ export class TelltaleHost {
     return [...this.#types.keys()];
   }
 
-  /** What adding a source would do, without adding it. Secret values come back masked. */
+  /**
+   * What adding a source would do, without adding it. Secret options come
+   * back masked, and a copy of a secret anywhere else in the plan (another
+   * option, a `does` line) comes back redacted.
+   */
   plan(typeName: string, options: Record<string, unknown> = {}): SourcePlan {
     const { type, plan } = this.#plan(typeName, options);
-    return { ...plan, options: mask(type.options, plan.options) };
+    // This request's secrets are not the host's yet (nothing was added), so they are redacted from this answer only.
+    const secrets = this.secrets.with([...secretValues(type.options, options), ...secretValues(type.options, plan.options)]);
+    return secrets.deep({ ...plan, options: mask(type.options, plan.options) });
   }
 
   /** Register a source. It does not start until something subscribes. */
@@ -296,7 +302,7 @@ export class TelltaleHost {
       id: reg.id,
       type: reg.typeName,
       trust: reg.trust,
-      options: mask(reg.type.options, reg.options),
+      options: this.secrets.deep(mask(reg.type.options, reg.options)),
       subscribers: this.#subscribers.get(id)?.size ?? 0,
       status: this.status(id)!,
     };
@@ -626,6 +632,10 @@ function mask(spec: Readonly<Record<string, OptionSpec>>, options: Record<string
   return Object.fromEntries(
     Object.entries(options).map(([k, v]) => [k, spec[k]?.secret === true && v !== undefined ? "[secret]" : v]),
   );
+}
+
+function secretValues(spec: Readonly<Record<string, OptionSpec>>, options: Record<string, unknown>): string[] {
+  return Object.entries(options).flatMap(([k, v]) => (spec[k]?.secret === true && typeof v === "string" ? [v] : []));
 }
 
 function canonical(value: unknown): unknown {
