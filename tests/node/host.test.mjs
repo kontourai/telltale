@@ -303,9 +303,9 @@ test("close() during a start: the start that finishes afterwards never runs, hol
   });
   host.add({ id: "slow", type: "slow" });
   const pending = host.subscribe("slow", () => {});
-  const closed = host.close();
+  const closed = host.close().then(() => stops);
   release();
-  await closed;
+  assert.equal(await closed, 1, "close() resolved only once the starting source was torn down");
   await assert.rejects(pending, /stopped while it was starting/);
   assert.equal(host.status("slow").state, "stopped");
   assert.equal(host.info("slow").subscribers, 0);
