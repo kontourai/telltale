@@ -180,3 +180,26 @@ test("bounds are checked at plan time", () => {
     assert.throws(() => host.plan("folder", { dir, [key]: 0 }), new RegExp(key));
   }
 });
+
+test("a folder already replaced by a link when the source starts is refused, not read through the link", async (t) => {
+  const dir = folder(t);
+  const outside = folder(t);
+  put(outside, "private.txt", "outside data");
+  const ctx = newHost();
+  ctx.host.add({ id: "drop", type: "folder", options: { dir, every: "1s" } });
+  // Swapped between add() (which resolved the path) and the first subscriber.
+  const moved = `${dir}-moved`;
+  t.after(() => rmSync(moved, { recursive: true, force: true }));
+  renameSync(dir, moved);
+  symlinkSync(outside, dir);
+  t.after(() => rmSync(dir, { force: true }));
+  const events = [];
+  await ctx.host.subscribe("drop", (e) => void events.push(e)).catch(() => {});
+  await ctx.clock.advance(0);
+  put(outside, "later.txt", "more outside data");
+  await ctx.clock.advance(1000);
+  await ctx.clock.advance(1000);
+  assert.deepEqual(events, []);
+  assert.notEqual(ctx.host.status("drop").state, "running");
+  assert.match(ctx.host.status("drop").error ?? "", /replaced/);
+});

@@ -375,3 +375,30 @@ test("changed(): a change whose delivery failed is seen again at the next look a
   await clock.advance(60_000);
   assert.deepEqual(attempts, ["b", "b"], "and, once delivered, not again");
 });
+
+test("a source closed from inside a delivery made during its own start never runs", async () => {
+  const { host, clock } = newHost({
+    options: {
+      types: {
+        eager: {
+          summary: "emits while starting",
+          options: {},
+          async start(api) {
+            await api.emit("hello", {}, { dedupKey: "hello" }).catch(() => {});
+            api.poll("1m", () => {});
+          },
+        },
+      },
+    },
+  });
+  host.add({ id: "eager", type: "eager" });
+  // close() from inside the delivery cannot wait for the start it is part of.
+  await assert.rejects(
+    host.subscribe("eager", async () => {
+      await host.close();
+    }),
+    /stopped while it was starting/,
+  );
+  assert.equal(host.status("eager").state, "stopped");
+  assert.equal(clock.pendingTimers(), 0);
+});

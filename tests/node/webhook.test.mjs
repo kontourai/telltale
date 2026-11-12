@@ -427,8 +427,18 @@ test("bearer with a delivery header folds duplicate delivery ids, and says it ha
   assert.ok(plan.does.some((d) => /NO replay protection/.test(d)));
 });
 
-test("an unsubscribe and a new subscriber do not reset the replay ledger, the limiter or the budget", async () => {
-  const { host, subscription } = await setup({ options: { perCredentialPerMinute: 2, unauthenticatedPerMinute: 1000 } });
+test("an unsubscribe and a new subscriber do not reset the default replay ledger, limiter or budget", async () => {
+  // No replay, audit or budget bound: the defaults are what must survive.
+  const ctx = newHost({ start: START });
+  const store = credentialStore({ enabled: true, tokens: [{ id: "ci-deploy", secret: SECRET }] });
+  ctx.host.add({
+    id: "inbound",
+    type: "webhook",
+    options: { perCredentialPerMinute: 2, unauthenticatedPerMinute: 1000 },
+    bindings: { credentials: store.credentials },
+  });
+  const { host } = ctx;
+  const { subscription } = await collect(host, "inbound");
   const n = nonce();
   assert.equal((await host.receive("inbound", request(BODY, { n }))).status, 202);
   await subscription.unsubscribe();
