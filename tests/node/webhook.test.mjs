@@ -691,42 +691,57 @@ function noExtendLedger() {
   };
 }
 
-test("an owner whose reservation lapsed cannot release the newer owner's: no two copies are in flight at once", async () => {
-  const c = await slowGithubHook({ replay: noExtendLedger() });
-  c.outcomes[0] = "fail";
-  const a = c.send();
+// Within one host the in-process exclusion keeps a second copy out entirely, so a
+// lapsed lease can only hand the key to a newer owner on another host sharing the ledger.
+async function twoHostsSharing(t, ledger) {
+  const hosts = [await slowGithubHook({ replay: ledger }), await slowGithubHook({ replay: ledger })];
+  t.after(() => {
+    for (const h of hosts) for (let i = 0; i < 4; i++) h.gates[i]?.();
+  });
+  const advance = async (ms) => {
+    for (const h of hosts) await h.clock.advance(ms);
+  };
+  return { one: hosts[0], two: hosts[1], advance };
+}
+
+test("an owner whose reservation lapsed cannot release the newer owner's: no two copies are in flight at once", async (t) => {
+  const { one, two, advance } = await twoHostsSharing(t, noExtendLedger());
+  one.outcomes[0] = "fail";
+  const a = one.send();
   await settle();
-  await c.clock.advance(3_600_001);
-  const b = c.send(); // A's key lapsed: B reserves it.
+  await advance(3_600_001);
+  const b = two.send(); // A's key lapsed: B, on the other host, reserves it.
   await settle();
-  assert.equal(c.attempts(), 2);
-  c.gates[0]();
+  assert.equal(two.attempts(), 1);
+  one.gates[0]();
   assert.equal((await a).status, 503);
-  const third = await c.send();
-  assert.equal(third.reason, "replay", "A's late release did not free B's reservation");
-  assert.equal(c.attempts(), 2);
-  assert.ok(c.log.lines.some((l) => l.includes("replay_release_not_owned")), "the mismatch is reported");
-  c.gates[1]();
+  const third = one.send();
+  await settle();
+  assert.equal(one.attempts(), 1, "A's late release freed B's reservation: a third copy was delivered");
+  assert.equal((await third).reason, "replay");
+  assert.ok(one.log.lines.some((l) => l.includes("replay_release_not_owned")), "the mismatch is reported");
+  two.gates[0]();
   assert.equal((await b).status, 202);
 });
 
-test("an owner whose reservation lapsed cannot commit the newer owner's: the newer one's failure still frees the key", async () => {
-  const c = await slowGithubHook({ replay: noExtendLedger() });
-  c.outcomes[1] = "fail";
-  const a = c.send();
+test("an owner whose reservation lapsed cannot commit the newer owner's: the newer one's failure still frees the key", async (t) => {
+  const { one, two, advance } = await twoHostsSharing(t, noExtendLedger());
+  two.outcomes[0] = "fail";
+  const a = one.send();
   await settle();
-  await c.clock.advance(3_600_001);
-  const b = c.send();
+  await advance(3_600_001);
+  const b = two.send();
   await settle();
-  c.gates[0]();
+  one.gates[0]();
   assert.equal((await a).status, 202);
-  assert.ok(c.log.lines.some((l) => l.includes("replay_commit_not_owned")));
-  c.gates[1]();
+  assert.ok(one.log.lines.some((l) => l.includes("replay_commit_not_owned")));
+  two.gates[0]();
   assert.equal((await b).status, 503);
-  const retry = c.send();
+  const retry = two.send();
   await settle();
-  c.gates[2]();
-  assert.equal((await retry).status, 202, "B's failure was not turned into a delivered key by A's late commit");
+  assert.equal(two.attempts(), 2, "B's failure was not turned into a delivered key by A's late commit");
+  two.gates[1]();
+  assert.equal((await retry).status, 202);
 });
 
 test("the in-memory ledger acts only for the token that owns a key", () => {
@@ -834,4 +849,159 @@ test("a source subscribed again while close() is draining accepts no request unt
   await closing;
   assert.equal((await pending).status, 202);
   assert.equal((await host.receive("inbound", request(BODY))).status, 202, "once close() finished, it listens again");
+});
+
+// ---- Fix round 3 -------------------------------------------------------------
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((a, b) => ((resolve = a), (reject = b)));
+  return { promise, resolve, reject };
+}
+
+/** One host; A blocks in the subscriber; `lose(c)` makes A's lease lapse some way; then an identical B arrives. */
+async function overlapAfter(t, { bindings = {}, options = {}, lose }) {
+  const ctx = newHost({ start: START, ...options });
+  ctx.host.add({ id: "gh", type: "webhook", options: { scheme: "signed-body", secret: SECRET, retentionHours: 1 }, bindings });
+  await collect(ctx.host, "gh");
+  const gates = [];
+  let attempts = 0;
+  await ctx.host.subscribe("gh", async () => {
+    const n = attempts++;
+    gates[n] = deferred();
+    await gates[n].promise;
+  });
+  t.after(() => gates.forEach((g) => g?.resolve()));
+  const body = '{"action":"completed"}';
+  const send = () => ctx.host.receive("gh", { headers: { "x-hub-signature-256": ghSign(body), "x-github-delivery": "guid" }, body });
+  const a = send();
+  await settle();
+  await lose(ctx);
+  const b = send();
+  await settle();
+  assert.equal(attempts, 1, "a second identical copy reached the subscriber while the first was still there");
+  assert.equal((await b).reason, "replay");
+  gates[0].resolve();
+  assert.equal((await a).status, 202);
+}
+
+test("however the lease is lost, one host never delivers two identical copies at once", async (t) => {
+  const ledgerWith = (extra) => {
+    const inner = new InMemoryReplayLedger();
+    return {
+      reserve: (...a) => inner.reserve(...a),
+      extend: (...a) => inner.extend(...a),
+      commit: (...a) => inner.commit(...a),
+      release: (...a) => inner.release(...a),
+      ...extra,
+    };
+  };
+  const pastExpiry = (ctx) => ctx.clock.advance(3_600_001);
+  for (const extend of [() => false, () => Promise.reject(new Error("offline")), () => new Promise(() => {})]) {
+    await overlapAfter(t, { bindings: { replay: ledgerWith({ extend }) }, lose: pastExpiry });
+  }
+  // A reserve whose answer arrives after the reservation already expired.
+  let first = true;
+  const late = deferred();
+  const inner = new InMemoryReplayLedger();
+  await overlapAfter(t, {
+    bindings: {
+      replay: ledgerWith({
+        reserve: (...a) => {
+          const r = inner.reserve(...a);
+          if (!first) return r;
+          first = false;
+          return late.promise.then(() => r);
+        },
+        extend: (...a) => inner.extend(...a),
+        commit: (...a) => inner.commit(...a),
+        release: (...a) => inner.release(...a),
+      }),
+    },
+    lose: async (ctx) => {
+      await ctx.clock.advance(3_600_001);
+      late.resolve();
+      await settle();
+    },
+  });
+  // A forward step of the wall clock, before any renewal runs.
+  let skew = 0;
+  const base = newHost({ start: START }).clock;
+  const clock = { now: () => base.now() + skew, setTimer: (...a) => base.setTimer(...a), clearTimer: (...a) => base.clearTimer(...a) };
+  await overlapAfter(t, {
+    options: { options: { clock } },
+    lose: async () => {
+      skew = 3_600_001;
+    },
+  });
+});
+
+test("an error's name and stack are redacted too, and add() redacts its earliest checks", async () => {
+  const token = randomBytes(20).toString("hex");
+  const { host } = newHost();
+  host.registerType("named", {
+    summary: "throws with its secret in the name",
+    options: { key: { type: "string", secret: true, description: "a secret" } },
+    plan() {
+      const e = new Error(`message ${token}`);
+      e.name = `name ${token}`;
+      throw e;
+    },
+    start() {},
+  });
+  for (const call of [() => host.plan("named", { key: token }), () => host.add({ id: "n", type: "named", options: { key: token } })]) {
+    let error;
+    try {
+      call();
+    } catch (e) {
+      error = e;
+    }
+    assert.ok(error.name.includes("[redacted]"), "the check reached the name");
+    assert.ok(![error.name, error.message, error.stack].join("\n").includes(token), "a secret leaked through the name or stack");
+  }
+  host.registerType("startname", {
+    summary: "start throws with its secret in the name",
+    options: { key: { type: "string", secret: true, description: "a secret" } },
+    start(api) {
+      const e = new Error("safe");
+      e.name = api.options.key;
+      throw e;
+    },
+  });
+  host.add({ id: "s", type: "startname", options: { key: token } });
+  const started = await host.subscribe("s", () => {}).catch((e) => e);
+  assert.ok(![started.name, started.message, started.stack].join("\n").includes(token));
+  // The secret copied into an invalid id, caught by the very first check.
+  let early;
+  try {
+    host.add({ id: `invalid/${SECRET}`, type: "webhook", options: { secret: SECRET } });
+  } catch (e) {
+    early = e;
+  }
+  assert.match(early.message, /not a usable source id/);
+  assert.ok(![early.message, early.stack].join("\n").includes(SECRET), "add()'s first check leaked the secret");
+});
+
+test("a repeated unsubscribe of the same subscription, from outside, joins the drain its first call began", async () => {
+  const { host, subscription } = await setup();
+  await subscription.unsubscribe(); // so `sub` below is the only subscriber
+  const gate = deferred();
+  let finished = false;
+  let sub;
+  sub = await host.subscribe("inbound", async () => {
+    await sub.unsubscribe(); // begins the stop from inside its own delivery
+    await gate.promise;
+    finished = true;
+  });
+  const pending = host.receive("inbound", request(BODY));
+  await settle();
+  let returned = false;
+  const again = sub.unsubscribe().then(() => (returned = true));
+  await settle();
+  assert.equal(returned, false, "the second unsubscribe returned while the delivery was unfinished");
+  gate.resolve();
+  await again;
+  assert.equal(finished, true);
+  assert.equal((await pending).status, 202);
 });

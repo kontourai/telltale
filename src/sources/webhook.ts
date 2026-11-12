@@ -221,6 +221,12 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
     const audit = api.bindings.audit ?? api.keep("audit", () => new InMemoryWebhookAudit());
     const limiter = api.keep("limiter", () => new AttemptLimiter(p.perCredentialPerMinute, RATE_WINDOW_MS));
     const budget = api.bindings.budget ?? api.keep("budget", () => new FailureBudget(p.unauthenticatedPerMinute, RATE_WINDOW_MS));
+    // Keys whose request this registration is handling right now, from before the
+    // reservation until its delivery settled. Independent of the ledger's lease:
+    // however the lease is lost (an extend that fails or stalls, a late reserve
+    // answer, a clock step), one host never hands the same request to subscribers
+    // twice at once. Several hosts sharing a ledger need a ledger that fences.
+    const handling = api.keep("handling", () => new Set<string>());
     const record = (reason: WebhookAuditEntry["reason"], credentialId?: string, count?: number) => {
       void Promise.resolve()
         .then(() =>
@@ -252,7 +258,7 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
           .finally(() => api.signal.removeEventListener("abort", onAbort));
       });
 
-    const verify = async (request: ReceivedRequest, authenticated: () => void): Promise<ReceiveResult> => {
+    const verify = async (request: ReceivedRequest, authenticated: () => void, held: Set<string>): Promise<ReceiveResult> => {
       const now = api.clock.now();
       const header = headerReader(request.headers);
       const refuse = (reason: WebhookRefusalReason, credentialId?: string, extra: { retryAfterSeconds?: number } = {}) => {
@@ -360,6 +366,10 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
       }
       let token: string | undefined;
       if (replayKey !== undefined) {
+        // Checked and taken in one synchronous step, before anything is awaited.
+        if (handling.has(replayKey)) return refuse("replay", credential.id);
+        handling.add(replayKey);
+        held.add(replayKey);
         const key = replayKey;
         let reservation: ReplayReservation;
         const asked = Promise.resolve().then(() => replay.reserve(key, expiresAt, received));
@@ -473,13 +483,16 @@ export const webhookSourceType: SourceType<WebhookBindings> = {
         admitted = false;
         budget.release();
       };
+      const held = new Set<string>();
       try {
-        return await verify(request, done);
+        return await verify(request, done, held);
       } catch (error) {
         if (error instanceof SourceStoppedError) return { accepted: false, status: 404, reason: "not_listening", retryable: true };
         throw error;
       } finally {
         done();
+        // The delivery settled (or never started): the key may be handled again.
+        for (const key of held) handling.delete(key);
       }
     });
   },
